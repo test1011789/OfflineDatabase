@@ -1,0 +1,1943 @@
+from __future__ import annotations
+
+import json
+import shutil
+import sqlite3
+import sys
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import tkinter as tk
+from tkinter import colorchooser, filedialog, messagebox, ttk
+
+from openpyxl import load_workbook
+
+
+APP_TITLE = '離線資料庫管理工具'
+DEFAULT_XLSX = 'initial_data.xlsx'
+LINK_MARKER = '📎'
+DEFAULT_LINK_COLUMN_WIDTH = 24
+PRODUCTION_MARKER = '🏭'
+DEFAULT_PRODUCTION_COLUMN_WIDTH = 34
+
+
+DEFAULT_LOOKUPS = [
+    ('EC', '乳劑'),
+    ('SC', '水懸劑'),
+    ('SG', '水溶性粒劑'),
+    ('SL', '溶液'),
+    ('SP', '水溶性粉劑'),
+    ('WG', '水分散性粒劑'),
+    ('WP', '可溼性粉劑'),
+    ('UL', '超低容量液劑'),
+    ('EW', '水基乳劑'),
+]
+
+DEFAULT_CATEGORY_COLORS = {
+    '除草劑': '#E2F0D9',
+    '殺蟲劑': '#FCE4D6',
+    '殺菌劑': '#DDEBF7',
+}
+
+DEFAULT_COLUMN_WIDTH = 140
+FIXED_UI_FONT_SIZE = 10
+
+BUILTIN_FIELD_KEYS = {
+    '核准': 'approval',
+    '生產': 'production',
+    '許可證號碼\nReg. NO.': 'permit_number',
+    '劑型': 'formulation',
+    '含量\nA.I.': 'content',
+    '劑型種類\nTerm': 'formulation_term',
+    '劑型種類代碼\nCode': 'formulation_code',
+    '中文普通名稱\nCommon name': 'common_name',
+    '成品名\nBrand Name': 'brand_name',
+    '倉庫白板貼': 'warehouse_board',
+    '作物': 'crop',
+    '使用特殊瓶': 'special_bottle',
+    '雅飛總經銷': 'distributor',
+    '版本': 'version',
+    '委外加工': 'outsourcing',
+}
+
+DEFAULT_DISPLAY_SETTINGS = {
+    'header_font_size': 10,
+    'data_font_size': 10,
+    'header_row_height': 42,
+    'data_row_height': 28,
+    'column_widths': {},
+    'link_column_widths': {},
+    'production_column_widths': {},
+    'show_link_marker': True,
+    'link_marker': LINK_MARKER,
+    'production_visible_columns': ['date', 'order', 'stock', 'manufacturer', 'remark'],
+}
+
+
+# -----------------------------
+# Portable paths and database
+# -----------------------------
+def app_dir() -> Path:
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def copy_file_portable(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with Path(source).open('rb') as src, Path(destination).open('wb') as dst:
+        while True:
+            chunk = src.read(1024 * 1024)
+            if not chunk:
+                break
+            dst.write(chunk)
+
+
+class Database:
+    def __init__(self, root: Path):
+        self.root = Path(root)
+        self.data_dir = self.root / 'data'
+        self.backup_dir = self.root / 'backup'
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        self.path = self.data_dir / 'app.db'
+        self.conn = sqlite3.connect(self.path)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute('PRAGMA foreign_keys = ON')
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        self.conn.executescript(
+            '''
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS fields (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL DEFAULT 'text',
+                options_json TEXT NOT NULL DEFAULT '[]',
+                color_map_json TEXT NOT NULL DEFAULT '{}',
+                position INTEGER NOT NULL,
+                system_key TEXT,
+                builtin INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS record_values (
+                record_id INTEGER NOT NULL,
+                field_id INTEGER NOT NULL,
+                value TEXT,
+                PRIMARY KEY (record_id, field_id),
+                FOREIGN KEY (record_id) REFERENCES records(id) ON DELETE CASCADE,
+                FOREIGN KEY (field_id) REFERENCES fields(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS record_links (
+                record_id INTEGER NOT NULL,
+                field_id INTEGER NOT NULL,
+                url TEXT NOT NULL,
+                PRIMARY KEY (record_id, field_id),
+                FOREIGN KEY (record_id) REFERENCES records(id) ON DELETE CASCADE,
+                FOREIGN KEY (field_id) REFERENCES fields(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS production_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                record_id INTEGER NOT NULL,
+                production_date TEXT NOT NULL DEFAULT '',
+                batch_no TEXT NOT NULL DEFAULT '',
+                quantity TEXT NOT NULL DEFAULT '',
+                order_quantity TEXT NOT NULL DEFAULT '',
+                stock_quantity TEXT NOT NULL DEFAULT '',
+                manufacturer TEXT NOT NULL DEFAULT '',
+                remark TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (record_id) REFERENCES records(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_production_records_record_id ON production_records(record_id);
+            CREATE TABLE IF NOT EXISTS lookup_pairs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT NOT NULL UNIQUE,
+                term TEXT NOT NULL,
+                position INTEGER NOT NULL DEFAULT 0
+            );
+            '''
+        )
+        production_columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(production_records)')}
+        if 'order_quantity' not in production_columns:
+            self.conn.execute("ALTER TABLE production_records ADD COLUMN order_quantity TEXT NOT NULL DEFAULT ''")
+        if 'stock_quantity' not in production_columns:
+            self.conn.execute("ALTER TABLE production_records ADD COLUMN stock_quantity TEXT NOT NULL DEFAULT ''")
+        if 'manufacturer' not in production_columns:
+            self.conn.execute("ALTER TABLE production_records ADD COLUMN manufacturer TEXT NOT NULL DEFAULT ''")
+        # 舊版的「quantity」資料視為下單數量，讓既有資料不會消失。
+        self.conn.execute("UPDATE production_records SET order_quantity = quantity WHERE TRIM(order_quantity) = '' AND TRIM(quantity) <> ''")
+
+        field_columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(fields)')}
+        if 'system_key' not in field_columns:
+            self.conn.execute('ALTER TABLE fields ADD COLUMN system_key TEXT')
+        self._backfill_system_keys()
+        for code, term in DEFAULT_LOOKUPS:
+            self.conn.execute(
+                'INSERT OR IGNORE INTO lookup_pairs(code, term, position) VALUES (?, ?, ?)',
+                (code, term, len(DEFAULT_LOOKUPS)),
+            )
+        self.conn.commit()
+
+    def _backfill_system_keys(self) -> None:
+        for name, system_key in BUILTIN_FIELD_KEYS.items():
+            self.conn.execute(
+                'UPDATE fields SET system_key = ? WHERE system_key IS NULL AND name = ?',
+                (system_key, name),
+            )
+        self.conn.commit()
+
+    @staticmethod
+    def builtin_key_for_name(name: str) -> str | None:
+        return BUILTIN_FIELD_KEYS.get(name)
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def has_data(self) -> bool:
+        return self.conn.execute('SELECT COUNT(*) FROM fields').fetchone()[0] > 0
+
+    def import_excel(self, xlsx_path: Path, replace: bool = False) -> tuple[int, int]:
+        wb_values = load_workbook(xlsx_path, data_only=True, read_only=False)
+        wb_formulas = load_workbook(xlsx_path, data_only=False, read_only=False)
+        ws = wb_values[wb_values.sheetnames[0]]
+        ws_formula = wb_formulas[wb_formulas.sheetnames[0]]
+
+        headers: list[str] = []
+        for col in range(1, ws.max_column + 1):
+            value = ws.cell(1, col).value
+            header = str(value).strip() if value is not None else f'欄位{col}'
+            headers.append(header)
+
+        descriptions_row = None
+        for row in range(2, ws.max_row + 1):
+            first_value = ws.cell(row, 1).value
+            if isinstance(first_value, str) and first_value.strip() == '欄位說明':
+                descriptions_row = row
+                break
+
+        end_row = (descriptions_row - 1) if descriptions_row else ws.max_row
+        data_rows: list[int] = []
+        for row in range(2, end_row + 1):
+            values = [ws.cell(row, col).value for col in range(1, ws.max_column + 1)]
+            if any(value not in (None, '') for value in values):
+                data_rows.append(row)
+
+        if replace:
+            self.conn.execute('DELETE FROM production_records')
+            self.conn.execute('DELETE FROM record_links')
+            self.conn.execute('DELETE FROM record_values')
+            self.conn.execute('DELETE FROM records')
+
+        current_fields = self.list_fields()
+        existing_names = {row['name']: row for row in current_fields}
+        existing_keys = {row['system_key']: row for row in current_fields if row['system_key']}
+        field_ids: list[int] = []
+        for position, name in enumerate(headers):
+            system_key = self.builtin_key_for_name(name)
+            existing = existing_keys.get(system_key) if system_key else existing_names.get(name)
+            if existing:
+                field_id = int(existing['id'])
+                if system_key and existing['system_key'] != system_key:
+                    self.conn.execute('UPDATE fields SET system_key = ? WHERE id = ?', (system_key, field_id))
+            else:
+                kind, options, colors = self._infer_field(name)
+                cursor = self.conn.execute(
+                    '''INSERT INTO fields(name, kind, options_json, color_map_json, position, system_key, builtin)
+                       VALUES (?, ?, ?, ?, ?, ?, 1)''',
+                    (name, kind, json.dumps(options, ensure_ascii=False), json.dumps(colors, ensure_ascii=False), position, system_key),
+                )
+                field_id = cursor.lastrowid
+            field_ids.append(int(field_id))
+
+        lookup_by_term = {term: code for code, term in DEFAULT_LOOKUPS}
+        for row in data_rows:
+            record_id = self.create_record({})
+            for col, field_id in enumerate(field_ids, start=1):
+                value = ws.cell(row, col).value
+                formula_cell = ws_formula.cell(row, col).value
+                # Array formulas in the source workbook are represented as objects by openpyxl.
+                if col == 7 and (value is None or not isinstance(value, (str, int, float))):
+                    value = lookup_by_term.get(str(ws.cell(row, 6).value).strip(), '')
+                if value is None:
+                    value = ''
+                if isinstance(value, float) and value.is_integer():
+                    value = str(int(value))
+                self.set_value(record_id, field_id, str(value))
+                hyperlink = ws.cell(row, col).hyperlink
+                if hyperlink and hyperlink.target:
+                    self.conn.execute(
+                        'INSERT OR REPLACE INTO record_links(record_id, field_id, url) VALUES (?, ?, ?)',
+                        (record_id, field_id, hyperlink.target),
+                    )
+            self._sync_linked_term(record_id)
+
+        self.conn.execute(
+            'INSERT OR REPLACE INTO app_meta(key, value) VALUES (?, ?)',
+            ('source_file', str(xlsx_path)),
+        )
+        self.conn.execute(
+            'INSERT OR REPLACE INTO app_meta(key, value) VALUES (?, ?)',
+            ('imported_at', datetime.now().isoformat(timespec='seconds')),
+        )
+        self.conn.commit()
+        return len(headers), len(data_rows)
+
+    @staticmethod
+    def _infer_field(name: str) -> tuple[str, list[str], dict[str, str]]:
+        if name in {'核准', '生產', '倉庫白板貼', '雅飛總經銷'}:
+            return 'dropdown', ['O', 'X'], {}
+        if name == '劑型':
+            return 'category', ['除草劑', '殺蟲劑', '殺菌劑'], DEFAULT_CATEGORY_COLORS.copy()
+        if name == '劑型種類\nTerm':
+            return 'computed', [], {}
+        if name == '劑型種類代碼\nCode':
+            return 'lookup', [], {}
+        if name == '版本':
+            return 'dropdown', ['1', '2', '3'], {}
+        return 'text', [], {}
+
+    def get_display_settings(self) -> dict[str, Any]:
+        settings = dict(DEFAULT_DISPLAY_SETTINGS)
+        row = self.conn.execute('SELECT value FROM app_meta WHERE key = ?', ('display_settings',)).fetchone()
+        if row:
+            try:
+                stored = json.loads(row['value'])
+                if isinstance(stored, dict):
+                    # 相容前一版設定：舊的 row_height 先沿用為資料列高。
+                    if 'data_row_height' not in stored and 'row_height' in stored:
+                        stored['data_row_height'] = stored['row_height']
+                    # 相容前一版單一字體設定，先同時套用到標題與資料。
+                    if 'header_font_size' not in stored and 'font_size' in stored:
+                        stored['header_font_size'] = stored['font_size']
+                    if 'data_font_size' not in stored and 'font_size' in stored:
+                        stored['data_font_size'] = stored['font_size']
+                    settings.update(stored)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        settings.pop('font_size', None)
+        settings.pop('row_height', None)
+        settings.pop('default_column_width', None)
+        settings.pop('form_gap', None)
+        if not isinstance(settings.get('column_widths'), dict):
+            settings['column_widths'] = {}
+        if not isinstance(settings.get('link_column_widths'), dict):
+            settings['link_column_widths'] = {}
+        if not isinstance(settings.get('production_column_widths'), dict):
+            settings['production_column_widths'] = {}
+        if not isinstance(settings.get('show_link_marker'), bool):
+            settings['show_link_marker'] = True
+        if not isinstance(settings.get('link_marker'), str):
+            settings['link_marker'] = LINK_MARKER
+        allowed_production_columns = {'date', 'order', 'stock', 'manufacturer', 'remark'}
+        visible = settings.get('production_visible_columns')
+        if not isinstance(visible, list):
+            settings['production_visible_columns'] = ['date', 'order', 'stock', 'manufacturer', 'remark']
+        else:
+            settings['production_visible_columns'] = [str(v) for v in visible if str(v) in allowed_production_columns]
+            if not settings['production_visible_columns']:
+                settings['production_visible_columns'] = ['date', 'order', 'stock', 'manufacturer', 'remark']
+        return settings
+
+    def save_display_settings(self, settings: dict[str, Any]) -> None:
+        merged = dict(DEFAULT_DISPLAY_SETTINGS)
+        merged.update(settings)
+        merged.pop('font_size', None)
+        merged.pop('row_height', None)
+        merged.pop('default_column_width', None)
+        merged.pop('form_gap', None)
+        self.conn.execute(
+            'INSERT OR REPLACE INTO app_meta(key, value) VALUES (?, ?)',
+            ('display_settings', json.dumps(merged, ensure_ascii=False)),
+        )
+        self.conn.commit()
+
+    def list_fields(self, active_only: bool = True) -> list[sqlite3.Row]:
+        sql = 'SELECT * FROM fields'
+        if active_only:
+            sql += ' WHERE active = 1'
+        sql += ' ORDER BY position, id'
+        return list(self.conn.execute(sql))
+
+    def get_field(self, field_id: int) -> sqlite3.Row | None:
+        return self.conn.execute('SELECT * FROM fields WHERE id = ?', (field_id,)).fetchone()
+
+    def reorder_fields(self, ordered_ids: list[int]) -> None:
+        for position, field_id in enumerate(ordered_ids):
+            self.conn.execute('UPDATE fields SET position = ? WHERE id = ?', (position, int(field_id)))
+        self.conn.commit()
+
+    def rename_field(self, field_id: int, name: str) -> None:
+        name = name.strip()
+        if not name:
+            raise ValueError('欄位名稱不可空白。')
+        duplicate = self.conn.execute(
+            'SELECT 1 FROM fields WHERE name = ? AND id <> ?', (name, field_id)
+        ).fetchone()
+        if duplicate:
+            raise ValueError('欄位名稱已存在。')
+        self.conn.execute('UPDATE fields SET name = ? WHERE id = ?', (name, field_id))
+        self.conn.commit()
+
+    def add_field(self, name: str, kind: str, options: list[str]) -> int:
+        name = name.strip()
+        if not name:
+            raise ValueError('欄位名稱不可空白。')
+        if self.conn.execute('SELECT 1 FROM fields WHERE name = ?', (name,)).fetchone():
+            raise ValueError('欄位名稱已存在。')
+        position = self.conn.execute('SELECT COALESCE(MAX(position), -1) + 1 FROM fields').fetchone()[0]
+        cursor = self.conn.execute(
+            '''INSERT INTO fields(name, kind, options_json, color_map_json, position, builtin)
+               VALUES (?, ?, ?, '{}', ?, 0)''',
+            (name, kind, json.dumps(options, ensure_ascii=False), position),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid)
+
+    def update_field_options(self, field_id: int, options: list[str]) -> None:
+        self.conn.execute(
+            'UPDATE fields SET options_json = ? WHERE id = ?',
+            (json.dumps(options, ensure_ascii=False), field_id),
+        )
+        self.conn.commit()
+
+    def update_field_colors(self, field_id: int, colors: dict[str, str]) -> None:
+        self.conn.execute(
+            'UPDATE fields SET color_map_json = ? WHERE id = ?',
+            (json.dumps(colors, ensure_ascii=False), field_id),
+        )
+        self.conn.commit()
+
+    def create_record(self, values: dict[int, Any]) -> int:
+        now = datetime.now().isoformat(timespec='seconds')
+        cursor = self.conn.execute(
+            'INSERT INTO records(created_at, updated_at) VALUES (?, ?)', (now, now)
+        )
+        record_id = int(cursor.lastrowid)
+        for field_id, value in values.items():
+            self.set_value(record_id, int(field_id), '' if value is None else str(value))
+        self._sync_linked_term(record_id)
+        self.conn.commit()
+        return record_id
+
+    def update_record(self, record_id: int, values: dict[int, Any]) -> None:
+        for field_id, value in values.items():
+            self.set_value(record_id, int(field_id), '' if value is None else str(value))
+        self._sync_linked_term(record_id)
+        self.conn.execute(
+            'UPDATE records SET updated_at = ? WHERE id = ?',
+            (datetime.now().isoformat(timespec='seconds'), record_id),
+        )
+        self.conn.commit()
+
+    def delete_record(self, record_id: int) -> None:
+        count = self.production_record_count(record_id)
+        if count:
+            raise ValueError(f'此資料仍有 {count} 筆生產記錄，請先刪除或處理生產記錄後再刪除主資料。')
+        self.conn.execute('DELETE FROM records WHERE id = ?', (record_id,))
+        self.conn.commit()
+
+    def set_value(self, record_id: int, field_id: int, value: str) -> None:
+        self.conn.execute(
+            '''INSERT INTO record_values(record_id, field_id, value) VALUES (?, ?, ?)
+               ON CONFLICT(record_id, field_id) DO UPDATE SET value = excluded.value''',
+            (record_id, field_id, value),
+        )
+
+    def get_record_values(self, record_id: int) -> dict[int, str]:
+        rows = self.conn.execute(
+            'SELECT field_id, value FROM record_values WHERE record_id = ?', (record_id,)
+        )
+        return {int(row['field_id']): (row['value'] or '') for row in rows}
+
+    def get_record_links(self, record_id: int) -> dict[int, str]:
+        rows = self.conn.execute(
+            'SELECT field_id, url FROM record_links WHERE record_id = ?', (record_id,)
+        )
+        return {int(row['field_id']): row['url'] for row in rows}
+
+    def set_record_link(self, record_id: int, field_id: int, url: str) -> None:
+        url = url.strip()
+        if url:
+            self.conn.execute(
+                'INSERT OR REPLACE INTO record_links(record_id, field_id, url) VALUES (?, ?, ?)',
+                (int(record_id), int(field_id), url),
+            )
+        else:
+            self.conn.execute(
+                'DELETE FROM record_links WHERE record_id = ? AND field_id = ?',
+                (int(record_id), int(field_id)),
+            )
+        self.conn.commit()
+
+    def all_records(self) -> list[dict[str, Any]]:
+        records = self.conn.execute('SELECT id, created_at, updated_at FROM records ORDER BY id')
+        result = []
+        for record in records:
+            result.append({
+                'id': int(record['id']),
+                'created_at': record['created_at'],
+                'updated_at': record['updated_at'],
+                'values': self.get_record_values(int(record['id'])),
+            })
+        return result
+
+    def production_records(self, record_id: int) -> list[sqlite3.Row]:
+        return list(self.conn.execute(
+            'SELECT * FROM production_records WHERE record_id = ? ORDER BY production_date DESC, id DESC',
+            (int(record_id),),
+        ))
+
+    def production_record_count(self, record_id: int) -> int:
+        return int(self.conn.execute(
+            'SELECT COUNT(*) FROM production_records WHERE record_id = ?', (int(record_id),)
+        ).fetchone()[0])
+
+    def create_production_record(self, record_id: int, production_date: str = '', order_quantity: str = '', stock_quantity: str = '', manufacturer: str = '', remark: str = '', batch_no: str = '') -> int:
+        if not self.conn.execute('SELECT 1 FROM records WHERE id = ?', (int(record_id),)).fetchone():
+            raise ValueError('找不到對應的主資料。')
+        now = datetime.now().isoformat(timespec='seconds')
+        cursor = self.conn.execute(
+            '''INSERT INTO production_records(record_id, production_date, batch_no, quantity, order_quantity, stock_quantity, manufacturer, remark, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (int(record_id), production_date.strip(), batch_no.strip(), order_quantity.strip(), order_quantity.strip(), stock_quantity.strip(), manufacturer.strip(), remark.strip(), now, now),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid)
+
+    def update_production_record(self, production_id: int, production_date: str, order_quantity: str, stock_quantity: str, manufacturer: str, remark: str, batch_no: str = '') -> None:
+        self.conn.execute(
+            '''UPDATE production_records
+               SET production_date = ?, batch_no = ?, quantity = ?, order_quantity = ?, stock_quantity = ?, manufacturer = ?, remark = ?, updated_at = ?
+               WHERE id = ?''',
+            (production_date.strip(), batch_no.strip(), order_quantity.strip(), order_quantity.strip(), stock_quantity.strip(), manufacturer.strip(), remark.strip(), datetime.now().isoformat(timespec='seconds'), int(production_id)),
+        )
+        self.conn.commit()
+
+    def delete_production_record(self, production_id: int) -> None:
+        self.conn.execute('DELETE FROM production_records WHERE id = ?', (int(production_id),))
+        self.conn.commit()
+
+    def lookup_pairs(self) -> list[sqlite3.Row]:
+        return list(self.conn.execute('SELECT * FROM lookup_pairs ORDER BY position, id'))
+
+    def add_lookup(self, code: str, term: str) -> None:
+        code, term = code.strip(), term.strip()
+        if not code or not term:
+            raise ValueError('代碼與中文名稱皆不可空白。')
+        if self.conn.execute('SELECT 1 FROM lookup_pairs WHERE code = ?', (code,)).fetchone():
+            raise ValueError('代碼已存在。')
+        position = self.conn.execute('SELECT COALESCE(MAX(position), -1) + 1 FROM lookup_pairs').fetchone()[0]
+        self.conn.execute('INSERT INTO lookup_pairs(code, term, position) VALUES (?, ?, ?)', (code, term, position))
+        self.conn.commit()
+
+    def update_lookup(self, lookup_id: int, code: str, term: str) -> None:
+        code, term = code.strip(), term.strip()
+        if not code or not term:
+            raise ValueError('代碼與中文名稱皆不可空白。')
+        duplicate = self.conn.execute(
+            'SELECT 1 FROM lookup_pairs WHERE code = ? AND id <> ?', (code, lookup_id)
+        ).fetchone()
+        if duplicate:
+            raise ValueError('代碼已存在。')
+        self.conn.execute('UPDATE lookup_pairs SET code = ?, term = ? WHERE id = ?', (code, term, lookup_id))
+        self.conn.commit()
+
+    def delete_lookup(self, lookup_id: int) -> None:
+        self.conn.execute('DELETE FROM lookup_pairs WHERE id = ?', (lookup_id,))
+        self.conn.commit()
+
+    def _sync_linked_term(self, record_id: int) -> None:
+        code_field = self.conn.execute(
+            'SELECT id FROM fields WHERE system_key = ?', ('formulation_code',)
+        ).fetchone()
+        term_field = self.conn.execute(
+            'SELECT id FROM fields WHERE system_key = ?', ('formulation_term',)
+        ).fetchone()
+        if not code_field or not term_field:
+            return
+        code = self.conn.execute(
+            'SELECT value FROM record_values WHERE record_id = ? AND field_id = ?',
+            (record_id, code_field['id']),
+        ).fetchone()
+        code_value = code['value'] if code else ''
+        pair = self.conn.execute('SELECT term FROM lookup_pairs WHERE code = ?', (code_value,)).fetchone()
+        term = pair['term'] if pair else ''
+        self.set_value(record_id, int(term_field['id']), term)
+
+    def backup(self, destination: Path | None = None) -> Path:
+        self.conn.commit()
+        if destination is None:
+            stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            destination = self.backup_dir / f'app_{stamp}.db'
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        copy_file_portable(self.path, destination)
+        return destination
+
+    def restore(self, source: Path) -> None:
+        self.conn.close()
+        copy_file_portable(source, self.path)
+        self.conn = sqlite3.connect(self.path)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute('PRAGMA foreign_keys = ON')
+        self._init_schema()
+
+    def close(self) -> None:
+        if self.conn:
+            self.conn.close()
+
+
+# -----------------------------
+# Small dialogs
+# -----------------------------
+class LookupDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Misc, title: str, code: str = '', term: str = ''):
+        super().__init__(parent)
+        self.title(title)
+        self.resizable(False, False)
+        self.result: tuple[str, str] | None = None
+        self.code_var = tk.StringVar(value=code)
+        self.term_var = tk.StringVar(value=term)
+        self._body()
+        self.transient(parent)
+        self.grab_set()
+        self.protocol('WM_DELETE_WINDOW', self.destroy)
+
+    def _body(self) -> None:
+        frame = ttk.Frame(self, padding=16)
+        frame.grid(sticky='nsew')
+        ttk.Label(frame, text='英文代碼').grid(row=0, column=0, sticky='w', padx=(0, 8), pady=6)
+        ttk.Entry(frame, textvariable=self.code_var, width=28).grid(row=0, column=1, pady=6)
+        ttk.Label(frame, text='中文名稱').grid(row=1, column=0, sticky='w', padx=(0, 8), pady=6)
+        ttk.Entry(frame, textvariable=self.term_var, width=28).grid(row=1, column=1, pady=6)
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=2, column=0, columnspan=2, pady=(12, 0), sticky='e')
+        ttk.Button(buttons, text='取消', command=self.destroy).pack(side='right', padx=(8, 0))
+        ttk.Button(buttons, text='儲存', command=self._save).pack(side='right')
+
+    def _save(self) -> None:
+        self.result = (self.code_var.get(), self.term_var.get())
+        self.destroy()
+
+
+class FieldDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Misc, db: Database, field: sqlite3.Row | None = None):
+        super().__init__(parent)
+        self.db = db
+        self.field = field
+        self.title('新增欄位' if field is None else '編輯欄位設定')
+        self.resizable(False, False)
+        self.result = False
+        self.name_var = tk.StringVar(value='' if field is None else field['name'])
+        self.kind_var = tk.StringVar(value='text' if field is None else field['kind'])
+        options = [] if field is None else json.loads(field['options_json'] or '[]')
+        self.options_var = tk.StringVar(value=', '.join(options))
+        self._body()
+        self.transient(parent)
+        self.grab_set()
+
+    def _body(self) -> None:
+        frame = ttk.Frame(self, padding=16)
+        frame.grid(sticky='nsew')
+        ttk.Label(frame, text='欄位名稱').grid(row=0, column=0, sticky='w', padx=(0, 8), pady=6)
+        name_entry = ttk.Entry(frame, textvariable=self.name_var, width=36)
+        name_entry.grid(row=0, column=1, pady=6)
+        self.name_entry = name_entry
+        ttk.Label(frame, text='欄位類型').grid(row=1, column=0, sticky='w', padx=(0, 8), pady=6)
+        kinds = [('text', '文字輸入'), ('dropdown', '下拉選單')]
+        kind_box = ttk.Combobox(frame, textvariable=self.kind_var, values=[x[0] for x in kinds], state='readonly', width=33)
+        kind_box.grid(row=1, column=1, pady=6)
+        kind_box.bind('<<ComboboxSelected>>', lambda _event: self._toggle_options())
+        if self.field is not None and self.field['builtin']:
+            kind_box.configure(state='disabled')
+        ttk.Label(frame, text='選項').grid(row=2, column=0, sticky='nw', padx=(0, 8), pady=6)
+        self.options_entry = ttk.Entry(frame, textvariable=self.options_var, width=36)
+        self.options_entry.grid(row=2, column=1, pady=6)
+        ttk.Label(frame, text='下拉選單請用逗號分隔，例如：甲,乙,丙', foreground='#666666').grid(row=3, column=1, sticky='w')
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=4, column=0, columnspan=2, pady=(14, 0), sticky='e')
+        if self.field is not None and self.field['system_key'] == 'formulation':
+            ttk.Button(buttons, text='設定劑型底色', command=self._colors).pack(side='left', padx=(0, 20))
+        ttk.Button(buttons, text='取消', command=self.destroy).pack(side='right', padx=(8, 0))
+        ttk.Button(buttons, text='儲存', command=self._save).pack(side='right')
+        self._toggle_options()
+
+    def _toggle_options(self) -> None:
+        if self.kind_var.get() == 'text':
+            self.options_entry.configure(state='disabled')
+        else:
+            self.options_entry.configure(state='normal')
+
+    def _colors(self) -> None:
+        if self.field is None:
+            return
+        colors = json.loads(self.field['color_map_json'] or '{}')
+        options = json.loads(self.field['options_json'] or '[]')
+        ColorDialog(self, self.db, self.field['id'], options, colors)
+
+    def _save(self) -> None:
+        name = self.name_var.get().strip()
+        if not name:
+            messagebox.showerror('欄位設定', '欄位名稱不可空白。', parent=self)
+            return
+        options = [item.strip() for item in self.options_var.get().split(',') if item.strip()]
+        try:
+            if self.field is None:
+                self.db.add_field(name, self.kind_var.get(), options)
+            else:
+                if self.field['builtin']:
+                    self.db.rename_field(self.field['id'], name)
+                    if self.field['kind'] != 'text':
+                        self.db.update_field_options(self.field['id'], options)
+                else:
+                    self.db.conn.execute(
+                        'UPDATE fields SET name = ?, kind = ?, options_json = ? WHERE id = ?',
+                        (name, self.kind_var.get(), json.dumps(options, ensure_ascii=False), self.field['id']),
+                    )
+                    self.db.conn.commit()
+            self.result = True
+            self.destroy()
+        except ValueError as exc:
+            messagebox.showerror('欄位設定', str(exc), parent=self)
+
+
+class LinkDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Misc, current_url: str = ''):
+        super().__init__(parent)
+        self.title('編輯連結')
+        self.resizable(False, False)
+        self.result: str | None = None
+        self.url_var = tk.StringVar(value=current_url)
+        frame = ttk.Frame(self, padding=16)
+        frame.grid(sticky='nsew')
+        ttk.Label(frame, text='連結網址或檔案路徑').grid(row=0, column=0, sticky='w', padx=(0, 8), pady=6)
+        entry = ttk.Entry(frame, textvariable=self.url_var, width=54)
+        entry.grid(row=0, column=1, pady=6)
+        entry.focus_set()
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=1, column=0, columnspan=2, sticky='e', pady=(12, 0))
+        ttk.Button(buttons, text='取消', command=self.destroy).pack(side='right', padx=(8, 0))
+        ttk.Button(buttons, text='儲存連結', command=self._save).pack(side='right')
+        self.bind('<Return>', lambda _event: self._save())
+        self.bind('<Escape>', lambda _event: self.destroy())
+        self.transient(parent)
+        self.grab_set()
+
+    def _save(self) -> None:
+        self.result = self.url_var.get().strip()
+        self.destroy()
+
+
+class ColorDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Misc, db: Database, field_id: int, options: list[str], colors: dict[str, str]):
+        super().__init__(parent)
+        self.db = db
+        self.field_id = field_id
+        self.colors = dict(colors)
+        self.title('設定劑型底色')
+        self.resizable(False, False)
+        frame = ttk.Frame(self, padding=16)
+        frame.grid(sticky='nsew')
+        self.entries: dict[str, tk.StringVar] = {}
+        for row, option in enumerate(options):
+            ttk.Label(frame, text=option, width=12).grid(row=row, column=0, sticky='w', pady=5)
+            var = tk.StringVar(value=self.colors.get(option, '#FFFFFF'))
+            self.entries[option] = var
+            ttk.Entry(frame, textvariable=var, width=14).grid(row=row, column=1, padx=6, pady=5)
+            ttk.Button(frame, text='選色', command=lambda opt=option, v=var: self._choose(opt, v)).grid(row=row, column=2, pady=5)
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=len(options), column=0, columnspan=3, sticky='e', pady=(12, 0))
+        ttk.Button(buttons, text='取消', command=self.destroy).pack(side='right', padx=(8, 0))
+        ttk.Button(buttons, text='儲存', command=self._save).pack(side='right')
+        self.transient(parent)
+        self.grab_set()
+
+    def _choose(self, option: str, var: tk.StringVar) -> None:
+        result = colorchooser.askcolor(color=var.get(), title=f'選擇「{option}」底色', parent=self)
+        if result and result[1]:
+            var.set(result[1].upper())
+
+    def _save(self) -> None:
+        colors = {option: var.get().strip() for option, var in self.entries.items()}
+        for option, color in colors.items():
+            if not (color.startswith('#') and len(color) == 7):
+                messagebox.showerror('底色設定', f'「{option}」的顏色格式應為 #RRGGBB。', parent=self)
+                return
+        self.db.update_field_colors(self.field_id, colors)
+        self.destroy()
+
+
+class DisplaySettingsDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Misc, db: Database, settings: dict[str, Any]):
+        super().__init__(parent)
+        self.db = db
+        self.settings = dict(settings)
+        self.title('顯示設定')
+        self.geometry('460x370')
+        self.minsize(420, 340)
+        self.resizable(False, False)
+        self.result = False
+        self.header_font_size_var = tk.IntVar(value=int(settings.get('header_font_size', settings.get('font_size', 10))))
+        self.data_font_size_var = tk.IntVar(value=int(settings.get('data_font_size', settings.get('font_size', 10))))
+        self.header_row_height_var = tk.IntVar(value=int(settings.get('header_row_height', 42)))
+        self.data_row_height_var = tk.IntVar(value=int(settings.get('data_row_height', 28)))
+        self.link_marker_var = tk.StringVar(value=str(settings.get('link_marker', LINK_MARKER)))
+        self.show_link_marker_var = tk.BooleanVar(value=bool(settings.get('show_link_marker', True)))
+        self._body()
+        self.transient(parent)
+        self.grab_set()
+
+    def _body(self) -> None:
+        frame = ttk.Frame(self, padding=20)
+        frame.pack(fill='both', expand=True)
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(frame, text='標題字體大小').grid(row=0, column=0, sticky='w', pady=7)
+        ttk.Spinbox(frame, from_=8, to=24, textvariable=self.header_font_size_var, width=12).grid(row=0, column=1, sticky='w', pady=7)
+        ttk.Label(frame, text='資料字體大小').grid(row=1, column=0, sticky='w', pady=7)
+        ttk.Spinbox(frame, from_=8, to=24, textvariable=self.data_font_size_var, width=12).grid(row=1, column=1, sticky='w', pady=7)
+        ttk.Label(frame, text='標題列高').grid(row=2, column=0, sticky='w', pady=7)
+        ttk.Spinbox(frame, from_=24, to=100, textvariable=self.header_row_height_var, width=12).grid(row=2, column=1, sticky='w', pady=7)
+        ttk.Label(frame, text='資料列高').grid(row=3, column=0, sticky='w', pady=7)
+        ttk.Spinbox(frame, from_=20, to=80, textvariable=self.data_row_height_var, width=12).grid(row=3, column=1, sticky='w', pady=7)
+        ttk.Label(frame, text='連結圖示文字').grid(row=4, column=0, sticky='w', pady=7)
+        ttk.Entry(frame, textvariable=self.link_marker_var, width=12).grid(row=4, column=1, sticky='w', pady=7)
+        ttk.Checkbutton(frame, text='顯示資料表連結圖示', variable=self.show_link_marker_var).grid(row=5, column=0, columnspan=2, sticky='w', pady=4)
+        ttk.Label(frame, text='可輸入 1 個符號或短文字；按「儲存設定」後立即套用並保存。', style='Hint.TLabel').grid(row=6, column=0, columnspan=2, sticky='w', pady=(4, 10))
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=7, column=0, columnspan=2, sticky='e', pady=(4, 0))
+        ttk.Button(buttons, text='取消', command=self.destroy).pack(side='right', padx=(8, 0))
+        ttk.Button(buttons, text='儲存設定', command=self._save).pack(side='right')
+
+    def _save(self) -> None:
+        try:
+            header_font_size = max(8, min(24, int(self.header_font_size_var.get())))
+            data_font_size = max(8, min(24, int(self.data_font_size_var.get())))
+            header_row_height = max(24, min(100, int(self.header_row_height_var.get())))
+            data_row_height = max(20, min(80, int(self.data_row_height_var.get())))
+            link_marker = self.link_marker_var.get().strip() or LINK_MARKER
+            if len(link_marker) > 4:
+                raise ValueError
+        except (TypeError, ValueError, tk.TclError):
+            messagebox.showerror('顯示設定', '請輸入有效的數字。', parent=self)
+            return
+        self.settings.update({
+            'header_font_size': header_font_size,
+            'data_font_size': data_font_size,
+            'header_row_height': header_row_height,
+            'data_row_height': data_row_height,
+            'link_marker': link_marker,
+            'show_link_marker': bool(self.show_link_marker_var.get()),
+        })
+        self.db.save_display_settings(self.settings)
+        self.result = True
+        self.destroy()
+
+
+# -----------------------------
+# Main application
+# -----------------------------
+class OfflineDatabaseApp(tk.Tk):
+    def __init__(self, db: Database):
+        super().__init__()
+        self.db = db
+        self.display_settings = self.db.get_display_settings()
+        self.title(APP_TITLE)
+        self.wm_title(APP_TITLE)
+        try:
+            self.iconbitmap(default='')
+        except tk.TclError:
+            pass
+        # 以透明 1x1 icon 隱藏 Windows 標題列左側的預設 Tk icon。
+        self._blank_window_icon = tk.PhotoImage(width=1, height=1)
+        self.iconphoto(True, self._blank_window_icon)
+        self.geometry('1440x820')
+        self.minsize(1050, 650)
+        self.protocol('WM_DELETE_WINDOW', self._on_close)
+        self.search_var = tk.StringVar()
+        self.status_var = tk.StringVar(value='就緒')
+        self.tree: ttk.Treeview
+        self._sort_field_id: int | None = None
+        self._sort_reverse = False
+        self._build_style()
+        self._build_ui()
+        self.refresh_all()
+
+    def _build_style(self) -> None:
+        style = ttk.Style(self)
+        try:
+            style.theme_use('vista')
+        except tk.TclError:
+            pass
+        header_font_size = int(self.display_settings.get('header_font_size', self.display_settings.get('font_size', 10)))
+        data_font_size = int(self.display_settings.get('data_font_size', self.display_settings.get('font_size', 10)))
+        header_row_height = int(self.display_settings.get('header_row_height', 42))
+        data_row_height = int(self.display_settings.get('data_row_height', 28))
+        self._tree_font = ('Microsoft JhengHei UI', data_font_size)
+        self._tree_heading_font = ('Microsoft JhengHei UI', header_font_size, 'bold')
+        style.configure('Title.TLabel', font=('Microsoft JhengHei UI', FIXED_UI_FONT_SIZE + 8, 'bold'))
+        style.configure('Hint.TLabel', foreground='#666666', font=('Microsoft JhengHei UI', FIXED_UI_FONT_SIZE))
+        style.configure('Treeview', rowheight=data_row_height, font=self._tree_font, borderwidth=0, relief='flat')
+        style.map('Treeview', background=[('selected', '#FFFFFF')], foreground=[('selected', '#000000')])
+        style.layout('Treeview', [('Treeview.treearea', {'sticky': 'nswe'})])
+        style.layout('FieldTreeview', style.layout('Treeview'))
+        style.configure('FieldTreeview', rowheight=data_row_height, font=self._tree_font, borderwidth=0, relief='flat')
+        style.map('FieldTreeview', background=[('selected', '#000000')], foreground=[('selected', '#FFFFFF')])
+        style.layout('FieldTreeview', [('Treeview.treearea', {'sticky': 'nswe'})])
+        style.configure('Treeview.Heading', font=self._tree_heading_font, padding=(6, max(4, (header_row_height - 20) // 2)))
+
+    def _build_ui(self) -> None:
+        header = ttk.Frame(self, padding=(16, 12, 16, 6))
+        header.pack(fill='x')
+        ttk.Label(header, text=APP_TITLE, style='Title.TLabel', anchor='w').pack(side='left', fill='x', expand=False)
+        ttk.Label(header, text='SQLite／完全離線／單一使用者', style='Hint.TLabel').pack(side='left', padx=18)
+        ttk.Label(header, textvariable=self.status_var, style='Hint.TLabel').pack(side='right')
+
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill='both', expand=True, padx=12, pady=(0, 12))
+        self.data_tab = ttk.Frame(notebook)
+        self.fields_tab = ttk.Frame(notebook)
+        self.lookup_tab = ttk.Frame(notebook)
+        self.backup_tab = ttk.Frame(notebook)
+        notebook.add(self.data_tab, text='資料管理')
+        notebook.add(self.fields_tab, text='欄位管理')
+        notebook.add(self.lookup_tab, text='代碼／名稱對照')
+        notebook.add(self.backup_tab, text='備份與還原')
+        self._build_data_tab()
+        self._build_fields_tab()
+        self._build_lookup_tab()
+        self._build_backup_tab()
+
+    def _build_data_tab(self) -> None:
+        toolbar = ttk.Frame(self.data_tab, padding=(10, 10, 10, 6))
+        toolbar.pack(fill='x')
+        ttk.Label(toolbar, text='搜尋').pack(side='left')
+        search = ttk.Entry(toolbar, textvariable=self.search_var, width=34)
+        search.pack(side='left', padx=(8, 5))
+        search.bind('<Return>', lambda _event: self.refresh_data())
+        ttk.Button(toolbar, text='搜尋', command=self.refresh_data).pack(side='left', padx=(0, 18))
+        ttk.Button(toolbar, text='新增資料', command=lambda: self.open_record_editor(None)).pack(side='left', padx=3)
+        ttk.Button(toolbar, text='編輯資料', command=self.edit_selected_record).pack(side='left', padx=3)
+        ttk.Button(toolbar, text='刪除資料', command=self.delete_selected_record).pack(side='left', padx=3)
+        ttk.Button(toolbar, text='從 Excel 匯入／更新', command=self.import_excel).pack(side='left', padx=18)
+        ttk.Button(toolbar, text='重新整理', command=self.refresh_data).pack(side='left', padx=3)
+        ttk.Button(toolbar, text='顯示設定', command=self.open_display_settings).pack(side='left', padx=(18, 3))
+        ttk.Label(toolbar, text='點擊欄位標題可排序', style='Hint.TLabel').pack(side='left', padx=10)
+
+        table_frame = ttk.Frame(self.data_tab, padding=(10, 0, 10, 10))
+        table_frame.pack(fill='both', expand=True)
+        self.tree = ttk.Treeview(table_frame, show='headings', selectmode='browse')
+        yscroll = ttk.Scrollbar(table_frame, orient='vertical', command=self.tree.yview)
+        xscroll = ttk.Scrollbar(table_frame, orient='horizontal', command=self.tree.xview)
+        self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.tree.grid(row=0, column=0, sticky='nsew')
+        yscroll.grid(row=0, column=1, sticky='ns')
+        xscroll.grid(row=1, column=0, sticky='ew')
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+        self.tree.bind('<Double-1>', self._on_tree_double_click)
+        self.tree.bind('<ButtonRelease-1>', self._on_tree_button_release, add='+')
+        self.tree.bind('<ButtonRelease-1>', self._on_tree_link_click, add='+')
+        self.tree.bind('<ButtonRelease-1>', self._on_tree_production_click, add='+')
+
+    def _build_fields_tab(self) -> None:
+        toolbar = ttk.Frame(self.fields_tab, padding=10)
+        toolbar.pack(fill='x')
+        ttk.Button(toolbar, text='新增欄位', command=self.add_field).pack(side='left')
+        ttk.Button(toolbar, text='編輯設定', command=self.edit_selected_field).pack(side='left', padx=6)
+        ttk.Button(toolbar, text='設定劑型底色', command=self.edit_category_colors).pack(side='left', padx=6)
+        ttk.Button(toolbar, text='上移', command=lambda: self.move_selected_field(-1)).pack(side='left', padx=(18, 3))
+        ttk.Button(toolbar, text='下移', command=lambda: self.move_selected_field(1)).pack(side='left', padx=3)
+        ttk.Label(toolbar, text='可拖曳欄位列，或使用上移／下移調整順序。', style='Hint.TLabel').pack(side='left', padx=18)
+        frame = ttk.Frame(self.fields_tab, padding=(10, 0, 10, 10))
+        frame.pack(fill='both', expand=True)
+        self.fields_tree = ttk.Treeview(frame, columns=('position', 'name', 'kind', 'options'), show='headings', selectmode='browse', style='FieldTreeview')
+        for key, text, width in [('position', '順序', 70), ('name', '欄位名稱', 270), ('kind', '類型', 120), ('options', '下拉選項', 600)]:
+            self.fields_tree.heading(key, text=text)
+            self.fields_tree.column(key, width=width, anchor='w')
+        scroll = ttk.Scrollbar(frame, orient='vertical', command=self.fields_tree.yview)
+        self.fields_tree.configure(yscrollcommand=scroll.set)
+        self.fields_tree.grid(row=0, column=0, sticky='nsew')
+        scroll.grid(row=0, column=1, sticky='ns')
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        self.fields_tree.bind('<Double-1>', lambda _event: self.edit_selected_field())
+        self.fields_tree.bind('<ButtonPress-1>', self._on_field_press, add='+')
+        self.fields_tree.bind('<B1-Motion>', self._on_field_drag, add='+')
+        self.fields_tree.bind('<ButtonRelease-1>', self._on_field_release, add='+')
+
+    def _on_field_press(self, event: Any) -> None:
+        iid = self.fields_tree.identify_row(event.y)
+        self._field_drag_iid = iid or None
+        if iid:
+            self.fields_tree.selection_set(iid)
+
+    def _on_field_drag(self, event: Any) -> None:
+        source_iid = getattr(self, '_field_drag_iid', None)
+        if not source_iid:
+            return
+        target_iid = self.fields_tree.identify_row(event.y)
+        if not target_iid or target_iid == source_iid:
+            return
+        children = list(self.fields_tree.get_children())
+        remaining = [item for item in children if item != source_iid]
+        target_index = remaining.index(target_iid)
+        target_bbox = self.fields_tree.bbox(target_iid)
+        if target_bbox and event.y > target_bbox[1] + target_bbox[3] // 2:
+            target_index += 1
+        self.fields_tree.move(source_iid, '', target_index)
+        self.fields_tree.selection_set(source_iid)
+
+    def _on_field_release(self, _event: Any) -> None:
+        source_iid = getattr(self, '_field_drag_iid', None)
+        self._field_drag_iid = None
+        if not source_iid:
+            return
+        ordered_ids = [int(iid) for iid in self.fields_tree.get_children()]
+        self.db.reorder_fields(ordered_ids)
+        self.refresh_fields()
+        self.refresh_data()
+        if self.fields_tree.exists(source_iid):
+            self.fields_tree.selection_set(source_iid)
+
+    def move_selected_field(self, direction: int) -> None:
+        iid = self._selected_id(self.fields_tree)
+        if iid is None:
+            messagebox.showwarning('欄位管理', '請先選取要移動的欄位。', parent=self)
+            return
+        ordered_ids = [int(item) for item in self.fields_tree.get_children()]
+        current_index = ordered_ids.index(iid)
+        target_index = current_index + (1 if direction > 0 else -1)
+        if target_index < 0 or target_index >= len(ordered_ids):
+            return
+        ordered_ids[current_index], ordered_ids[target_index] = ordered_ids[target_index], ordered_ids[current_index]
+        self.db.reorder_fields(ordered_ids)
+        self.refresh_fields()
+        self.refresh_data()
+        self.fields_tree.selection_set(str(iid))
+
+    def _build_lookup_tab(self) -> None:
+        toolbar = ttk.Frame(self.lookup_tab, padding=10)
+        toolbar.pack(fill='x')
+        ttk.Button(toolbar, text='新增對照', command=self.add_lookup).pack(side='left')
+        ttk.Button(toolbar, text='編輯對照', command=self.edit_selected_lookup).pack(side='left', padx=6)
+        ttk.Button(toolbar, text='刪除對照', command=self.delete_selected_lookup).pack(side='left', padx=6)
+        ttk.Label(toolbar, text='G 欄選擇英文代碼後，F 欄會自動顯示對應中文名稱。', style='Hint.TLabel').pack(side='left', padx=18)
+        frame = ttk.Frame(self.lookup_tab, padding=(10, 0, 10, 10))
+        frame.pack(fill='both', expand=True)
+        self.lookup_tree = ttk.Treeview(frame, columns=('code', 'term'), show='headings', selectmode='browse', style='FieldTreeview')
+        self.lookup_tree.heading('code', text='英文代碼')
+        self.lookup_tree.heading('term', text='中文名稱')
+        self.lookup_tree.column('code', width=240, anchor='w')
+        self.lookup_tree.column('term', width=360, anchor='w')
+        scroll = ttk.Scrollbar(frame, orient='vertical', command=self.lookup_tree.yview)
+        self.lookup_tree.configure(yscrollcommand=scroll.set)
+        self.lookup_tree.grid(row=0, column=0, sticky='nsew')
+        scroll.grid(row=0, column=1, sticky='ns')
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        self.lookup_tree.bind('<Double-1>', lambda _event: self.edit_selected_lookup())
+
+    def _build_backup_tab(self) -> None:
+        frame = ttk.Frame(self.backup_tab, padding=24)
+        frame.pack(fill='both', expand=True, anchor='nw')
+        ttk.Label(frame, text='資料庫檔案位置', font=('Microsoft JhengHei UI', 11, 'bold')).pack(anchor='w')
+        ttk.Label(frame, text=str(self.db.path), style='Hint.TLabel').pack(anchor='w', pady=(6, 20))
+        ttk.Label(frame, text='備份與還原會直接處理整個 SQLite 資料庫，建議定期備份 data\app.db。', style='Hint.TLabel').pack(anchor='w', pady=(0, 14))
+        ttk.Button(frame, text='立即備份到程式 backup 資料夾', command=self.backup_now).pack(anchor='w', pady=5)
+        ttk.Button(frame, text='另存備份檔', command=self.backup_as).pack(anchor='w', pady=5)
+        ttk.Button(frame, text='從備份檔還原', command=self.restore_backup).pack(anchor='w', pady=5)
+
+    def refresh_all(self) -> None:
+        self.refresh_data()
+        self.refresh_fields()
+        self.refresh_lookup()
+
+    def _on_tree_button_release(self, _event: Any) -> None:
+        # 讓 Treeview 先完成拖曳寬度更新，再讀取實際欄寬並保存。
+        self.after_idle(self._save_current_column_widths)
+
+    def _link_at_event(self, event: Any) -> str | None:
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return None
+        column = self.tree.identify_column(event.x)
+        if not column.startswith('#'):
+            return None
+        try:
+            column_index = int(column[1:]) - 1
+            column_id = self.tree['columns'][column_index]
+        except (ValueError, IndexError, tk.TclError):
+            return None
+        if not str(column_id).startswith('link'):
+            return None
+        try:
+            field_id = int(str(column_id)[4:])
+            record_id = int(item)
+        except ValueError:
+            return None
+        return self.db.get_record_links(record_id).get(field_id)
+
+    def _on_tree_link_click(self, event: Any) -> None:
+        url = self._link_at_event(event)
+        if url:
+            self.open_link(url)
+
+    def _production_record_at_event(self, event: Any) -> int | None:
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return None
+        column = self.tree.identify_column(event.x)
+        if not column.startswith('#'):
+            return None
+        try:
+            column_index = int(column[1:]) - 1
+            column_id = self.tree['columns'][column_index]
+            if not str(column_id).startswith('production'):
+                return None
+            return int(item)
+        except (ValueError, IndexError, tk.TclError):
+            return None
+
+    def _on_tree_production_click(self, event: Any) -> None:
+        record_id = self._production_record_at_event(event)
+        if record_id is not None:
+            self.open_production_records(record_id)
+
+    def _on_tree_double_click(self, event: Any) -> str | None:
+        if self._production_record_at_event(event) is not None:
+            return 'break'
+        url = self._link_at_event(event)
+        if url:
+            self.open_link(url)
+            return 'break'
+        self.edit_selected_record()
+        return None
+
+    def _save_current_column_widths(self) -> None:
+        if not hasattr(self, 'tree') or not self.tree.winfo_exists():
+            return
+        fields = self.db.list_fields()
+        widths = dict(self.display_settings.get('column_widths', {}))
+        link_widths = dict(self.display_settings.get('link_column_widths', {}))
+        production_widths = dict(self.display_settings.get('production_column_widths', {}))
+        changed = False
+        for field in fields:
+            field_id = int(field['id'])
+            column_id = f'c{field_id}'
+            try:
+                width = int(self.tree.column(column_id, 'width'))
+            except (tk.TclError, TypeError, ValueError):
+                width = 0
+            if width > 0 and widths.get(str(field_id)) != width:
+                widths[str(field_id)] = width
+                changed = True
+            link_column_id = f'link{field_id}'
+            try:
+                link_width = int(self.tree.column(link_column_id, 'width'))
+            except (tk.TclError, TypeError, ValueError):
+                link_width = 0
+            if link_width > 0 and link_widths.get(str(field_id)) != link_width:
+                link_widths[str(field_id)] = link_width
+                changed = True
+            production_column_id = f'production{field_id}'
+            try:
+                production_width = int(self.tree.column(production_column_id, 'width'))
+            except (tk.TclError, TypeError, ValueError):
+                production_width = 0
+            if production_width > 0 and production_widths.get(str(field_id)) != production_width:
+                production_widths[str(field_id)] = production_width
+                changed = True
+        if changed:
+            self.display_settings['column_widths'] = widths
+            self.display_settings['link_column_widths'] = link_widths
+            self.display_settings['production_column_widths'] = production_widths
+            self.db.save_display_settings(self.display_settings)
+
+    def refresh_data(self) -> None:
+        fields = self.db.list_fields()
+        records = self.db.all_records()
+        record_links = {int(record['id']): self.db.get_record_links(int(record['id'])) for record in records}
+        show_link_marker = bool(self.display_settings.get('show_link_marker', True))
+        link_marker = str(self.display_settings.get('link_marker', LINK_MARKER)) or LINK_MARKER
+        link_field_ids = {
+            int(field['id'])
+            for field in fields
+            if show_link_marker and any(int(field['id']) in links for links in record_links.values())
+        }
+        query = self.search_var.get().strip().lower()
+        self.tree.delete(*self.tree.get_children())
+        columns: list[str] = []
+        for field in fields:
+            field_id = int(field['id'])
+            columns.append(f'c{field_id}')
+            if field_id in link_field_ids:
+                columns.append(f'link{field_id}')
+            if field['system_key'] == 'brand_name':
+                columns.append(f'production{field_id}')
+        self.tree['columns'] = columns
+        column_widths = self.display_settings.get('column_widths', {})
+        link_column_widths = self.display_settings.get('link_column_widths', {})
+        production_widths = self.display_settings.get('production_column_widths', {})
+        fallback_width = DEFAULT_COLUMN_WIDTH
+        for field in fields:
+            field_id = int(field['id'])
+            column_id = f'c{field_id}'
+            arrow = ''
+            if self._sort_field_id == field_id:
+                arrow = ' ▼' if self._sort_reverse else ' ▲'
+            self.tree.heading(
+                column_id,
+                text=field['name'] + arrow,
+                anchor='center',
+                command=lambda selected_id=field_id: self.sort_by_field(selected_id),
+            )
+            width = int(column_widths.get(str(field_id), fallback_width))
+            width = max(60, min(600, width))
+            self.tree.column(column_id, width=width, anchor='center', stretch=False)
+            if field_id in link_field_ids:
+                link_column_id = f'link{field_id}'
+                self.tree.heading(link_column_id, text='', anchor='center')
+                link_width = int(link_column_widths.get(str(field_id), DEFAULT_LINK_COLUMN_WIDTH))
+                link_width = max(18, min(100, link_width))
+                self.tree.column(link_column_id, width=link_width, minwidth=18, anchor='center', stretch=False)
+            if field['system_key'] == 'brand_name':
+                production_column_id = f'production{field_id}'
+                self.tree.heading(production_column_id, text='', anchor='center')
+                production_width = int(production_widths.get(str(field_id), DEFAULT_PRODUCTION_COLUMN_WIDTH))
+                production_width = max(28, min(100, production_width))
+                self.tree.column(production_column_id, width=production_width, minwidth=28, anchor='center', stretch=False)
+        if self._sort_field_id is not None:
+            sort_field_id = self._sort_field_id
+            records_nonempty = []
+            records_empty = []
+            for record in records:
+                value = str(record['values'].get(sort_field_id, '') or '').strip()
+                (records_empty if not value else records_nonempty).append(record)
+            records_nonempty.sort(key=lambda record: self._sort_key(record['values'].get(sort_field_id, '')), reverse=self._sort_reverse)
+            records = records_nonempty + records_empty
+        category_field = next((f for f in fields if f['system_key'] == 'formulation'), None)
+        category_colors = json.loads(category_field['color_map_json'] or '{}') if category_field else {}
+        color_tags: dict[str, str] = {}
+        shown = 0
+        for record in records:
+            values: list[Any] = []
+            for field in fields:
+                field_id = int(field['id'])
+                values.append(record['values'].get(field_id, ''))
+                if field['system_key'] == 'brand_name':
+                    values.append(PRODUCTION_MARKER)
+                if field_id in link_field_ids:
+                    values.append(link_marker if record_links.get(int(record['id']), {}).get(field_id) else '')
+            searchable_values = [record['values'].get(int(field['id']), '') for field in fields]
+            if query and query not in ' '.join(str(value).lower() for value in searchable_values):
+                continue
+            tags: tuple[str, ...] = ()
+            category_value = ''
+            if category_field:
+                category_value = record['values'].get(int(category_field['id']), '')
+            if category_value in category_colors:
+                tag = f'category_{category_value}'
+                if tag not in color_tags:
+                    color_tags[tag] = category_colors[category_value]
+                    self.tree.tag_configure(tag, background=category_colors[category_value])
+                tags = (tag,)
+            self.tree.insert('', 'end', iid=str(record['id']), values=values, tags=tags)
+            shown += 1
+        self.status_var.set(f'資料 {shown} 筆／欄位 {len(fields)} 個')
+
+    @staticmethod
+    def _sort_key(value: Any) -> tuple[Any, ...]:
+        text = str(value or '').strip()
+        try:
+            numeric = float(text.rstrip('%'))
+            return (0, 0, numeric)
+        except ValueError:
+            return (0, 1, text.casefold())
+
+    def sort_by_field(self, field_id: int) -> None:
+        if self._sort_field_id == field_id:
+            self._sort_reverse = not self._sort_reverse
+        else:
+            self._sort_field_id = field_id
+            self._sort_reverse = False
+        self.refresh_data()
+
+    def open_display_settings(self) -> None:
+        dialog = DisplaySettingsDialog(self, self.db, self.display_settings)
+        self.wait_window(dialog)
+        if dialog.result:
+            self.display_settings = self.db.get_display_settings()
+            self._apply_display_settings()
+            self.refresh_data()
+
+    def _apply_display_settings(self) -> None:
+        style = ttk.Style(self)
+        header_font_size = int(self.display_settings.get('header_font_size', self.display_settings.get('font_size', 10)))
+        data_font_size = int(self.display_settings.get('data_font_size', self.display_settings.get('font_size', 10)))
+        header_row_height = int(self.display_settings.get('header_row_height', 42))
+        data_row_height = int(self.display_settings.get('data_row_height', 28))
+        self._tree_font = ('Microsoft JhengHei UI', data_font_size)
+        self._tree_heading_font = ('Microsoft JhengHei UI', header_font_size, 'bold')
+        style.configure('Hint.TLabel', font=('Microsoft JhengHei UI', FIXED_UI_FONT_SIZE))
+        style.configure('Treeview', rowheight=data_row_height, font=self._tree_font, borderwidth=0, relief='flat')
+        style.map('Treeview', background=[('selected', '#FFFFFF')], foreground=[('selected', '#000000')])
+        style.layout('Treeview', [('Treeview.treearea', {'sticky': 'nswe'})])
+        style.layout('FieldTreeview', style.layout('Treeview'))
+        style.configure('FieldTreeview', rowheight=data_row_height, font=self._tree_font, borderwidth=0, relief='flat')
+        style.map('FieldTreeview', background=[('selected', '#000000')], foreground=[('selected', '#FFFFFF')])
+        style.layout('FieldTreeview', [('Treeview.treearea', {'sticky': 'nswe'})])
+        style.configure('Treeview.Heading', font=self._tree_heading_font, padding=(6, max(4, (header_row_height - 20) // 2)))
+
+    def refresh_fields(self) -> None:
+        self.fields_tree.delete(*self.fields_tree.get_children())
+        kind_names = {'text': '文字輸入', 'dropdown': '下拉選單', 'category': '分類下拉', 'computed': '自動顯示', 'lookup': '代碼下拉'}
+        for field in self.db.list_fields():
+            options = json.loads(field['options_json'] or '[]')
+            self.fields_tree.insert('', 'end', iid=str(field['id']), values=(field['position'] + 1, field['name'], kind_names.get(field['kind'], field['kind']), ', '.join(options)))
+
+    def refresh_lookup(self) -> None:
+        self.lookup_tree.delete(*self.lookup_tree.get_children())
+        for row in self.db.lookup_pairs():
+            self.lookup_tree.insert('', 'end', iid=str(row['id']), values=(row['code'], row['term']))
+
+    def import_excel(self) -> None:
+        path = filedialog.askopenfilename(title='選擇 Excel 檔案', filetypes=[('Excel 檔案', '*.xlsx'), ('所有檔案', '*.*')])
+        if not path:
+            return
+        replace = messagebox.askyesno('匯入方式', '要先清除目前資料列再重新匯入嗎？\n選擇「是」只會清除資料列，會保留欄位名稱、欄位順序、欄寬、字體及其他設定。\n選擇「否」會保留現有資料，並在後方補入 Excel 資料。', parent=self)
+        try:
+            fields, records = self.db.import_excel(Path(path), replace=replace)
+            self.refresh_all()
+            messagebox.showinfo('匯入完成', f'已處理 {fields} 個欄位、{records} 筆資料。', parent=self)
+        except Exception as exc:
+            messagebox.showerror('匯入失敗', str(exc), parent=self)
+
+    def _selected_id(self, tree: ttk.Treeview) -> int | None:
+        selection = tree.selection()
+        if not selection:
+            return None
+        return int(selection[0])
+
+    def edit_selected_record(self) -> None:
+        record_id = self._selected_id(self.tree)
+        if record_id is None:
+            messagebox.showwarning('資料管理', '請先選取一筆資料。', parent=self)
+            return
+        self.open_record_editor(record_id)
+
+    def delete_selected_record(self) -> None:
+        record_id = self._selected_id(self.tree)
+        if record_id is None:
+            messagebox.showwarning('資料管理', '請先選取一筆資料。', parent=self)
+            return
+        if messagebox.askyesno('刪除資料', '確定要刪除選取的資料嗎？', parent=self):
+            self.db.delete_record(record_id)
+            self.refresh_data()
+
+    def open_record_editor(self, record_id: int | None) -> None:
+        win = tk.Toplevel(self)
+        win.title('新增資料' if record_id is None else '編輯資料')
+        win.geometry('760x760')
+        win.transient(self)
+
+        outer = ttk.Frame(win)
+        outer.pack(fill='both', expand=True)
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer, orient='vertical', command=canvas.yview)
+        form = ttk.Frame(canvas, padding=18)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky='nsew')
+        scrollbar.grid(row=0, column=1, sticky='ns')
+        outer.rowconfigure(0, weight=1)
+        outer.columnconfigure(0, weight=1)
+        window_id = canvas.create_window((0, 0), window=form, anchor='nw')
+        form.bind('<Configure>', lambda _event: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>', lambda event: canvas.itemconfigure(window_id, width=event.width))
+
+        fields = self.db.list_fields()
+        old_values = self.db.get_record_values(record_id) if record_id is not None else {}
+        links = self.db.get_record_links(record_id) if record_id is not None else {}
+        variables: dict[int, tk.StringVar] = {}
+        link_variables: dict[int, tk.StringVar] = {}
+        widgets: dict[int, tk.Widget] = {}
+        field_by_key = {field['system_key']: field for field in fields if field['system_key']}
+        code_field = field_by_key.get('formulation_code')
+        term_field = field_by_key.get('formulation_term')
+
+        for row, field in enumerate(fields):
+            field_id = int(field['id'])
+            label = field['name'].replace('\n', ' ')
+            ttk.Label(form, text=label, width=26).grid(row=row, column=0, sticky='nw', padx=(0, 12), pady=4)
+            var = tk.StringVar(value=old_values.get(field_id, ''))
+            variables[field_id] = var
+            kind = field['kind']
+            if kind == 'computed':
+                entry = ttk.Entry(form, textvariable=var, state='readonly', width=48)
+                entry.grid(row=row, column=1, sticky='ew', pady=4)
+                widgets[field_id] = entry
+            elif kind in {'dropdown', 'category'}:
+                options = json.loads(field['options_json'] or '[]')
+                entry = ttk.Combobox(form, textvariable=var, values=options, state='readonly', width=45)
+                entry.grid(row=row, column=1, sticky='ew', pady=4)
+                widgets[field_id] = entry
+            elif kind == 'lookup':
+                options = [row['code'] for row in self.db.lookup_pairs()]
+                entry = ttk.Combobox(form, textvariable=var, values=options, state='readonly', width=45)
+                entry.grid(row=row, column=1, sticky='ew', pady=4)
+                widgets[field_id] = entry
+            else:
+                entry = ttk.Entry(form, textvariable=var, width=48)
+                entry.grid(row=row, column=1, sticky='ew', pady=4)
+                widgets[field_id] = entry
+            # 所有欄位類型都可以附加連結，包括文字、下拉選單、分類及自動顯示欄位。
+            if field_id:
+                link_var = tk.StringVar(value=links.get(field_id, ''))
+                link_variables[field_id] = link_var
+                link_buttons = ttk.Frame(form)
+                link_buttons.grid(row=row, column=2, padx=(8, 0), pady=4, sticky='w')
+                if link_var.get().strip():
+                    ttk.Button(link_buttons, text='開啟連結', command=lambda variable=link_var: self.open_link(variable.get())).pack(side='left')
+                ttk.Button(link_buttons, text='編輯連結', command=lambda variable=link_var: self.edit_link(win, variable)).pack(side='left', padx=(6, 0))
+
+        form.columnconfigure(1, weight=1)
+
+        def sync_term(*_args: Any) -> None:
+            if not code_field or not term_field:
+                return
+            code = variables[int(code_field['id'])].get()
+            pair = next((row for row in self.db.lookup_pairs() if row['code'] == code), None)
+            variables[int(term_field['id'])].set(pair['term'] if pair else '')
+
+        if code_field:
+            variables[int(code_field['id'])].trace_add('write', sync_term)
+            sync_term()
+
+        buttons = ttk.Frame(win, padding=(18, 8, 18, 18))
+        buttons.pack(fill='x')
+
+        def save() -> None:
+            values = {field_id: var.get() for field_id, var in variables.items()}
+            try:
+                saved_record_id = record_id if record_id is not None else self.db.create_record(values)
+                if record_id is not None:
+                    self.db.update_record(record_id, values)
+                for field_id, link_var in link_variables.items():
+                    self.db.set_record_link(saved_record_id, field_id, link_var.get())
+                win.destroy()
+                self.refresh_data()
+            except Exception as exc:
+                messagebox.showerror('儲存失敗', str(exc), parent=win)
+
+        ttk.Button(buttons, text='取消', command=win.destroy).pack(side='right', padx=(8, 0))
+        ttk.Button(buttons, text='儲存資料', command=save).pack(side='right')
+        win.grab_set()
+
+    def _record_display_name(self, record_id: int) -> str:
+        fields = self.db.list_fields()
+        values = self.db.get_record_values(record_id)
+        brand = next((f for f in fields if f['system_key'] == 'brand_name'), None)
+        permit = next((f for f in fields if f['system_key'] == 'permit_number'), None)
+        brand_name = values.get(int(brand['id']), '') if brand else ''
+        permit_no = values.get(int(permit['id']), '') if permit else ''
+        if brand_name and permit_no:
+            return f'{brand_name}（{permit_no}）'
+        return brand_name or permit_no or f'資料 #{record_id}'
+
+    def open_production_records(self, record_id: int) -> None:
+        """開啟單一成品的生產履歷視窗，依 Prototype 的 Dashboard 版面呈現。"""
+        product_name = self._record_display_name(record_id)
+        fields = self.db.list_fields()
+        values = self.db.get_record_values(record_id)
+
+        def field_value(system_key: str) -> str:
+            field = next((f for f in fields if f['system_key'] == system_key), None)
+            return str(values.get(int(field['id']), '') or '') if field else ''
+
+        formulation = field_value('formulation')
+        content = field_value('content')
+
+        win = tk.Toplevel(self)
+        win.title(f'生產記錄 - {product_name}')
+        win.geometry('1180x760')
+        win.minsize(980, 650)
+        win.transient(self)
+        try:
+            win.iconphoto(True, self._blank_window_icon)
+        except Exception:
+            pass
+
+        # 視窗底色與 Prototype 接近的白色卡片式介面。
+        outer = tk.Frame(win, bg='#FFFFFF', bd=1, relief='solid')
+        outer.pack(fill='both', expand=True, padx=8, pady=8)
+
+        # ---------- Header ----------
+        header = tk.Frame(outer, bg='#FFFFFF')
+        header.pack(fill='x', padx=28, pady=(24, 10))
+        title_frame = tk.Frame(header, bg='#FFFFFF')
+        title_frame.pack(side='left', fill='x', expand=True)
+        tk.Label(title_frame, text=product_name, bg='#FFFFFF', fg='#111111',
+                 font=('Microsoft JhengHei UI', 24, 'bold')).pack(anchor='w')
+
+        subtitle_parts = []
+        if formulation:
+            subtitle_parts.append(formulation)
+        if content:
+            subtitle_parts.append(content)
+        subtitle_prefix = ' / '.join(subtitle_parts)
+        latest_rows = self.db.production_records(record_id)
+        latest_date = str(latest_rows[0]['production_date'] or '') if latest_rows else ''
+        if latest_date:
+            subtitle_parts.append(f'最近生產 {latest_date}')
+        subtitle = ' / '.join(subtitle_parts) if subtitle_parts else '尚無生產記錄'
+        tk.Label(title_frame, text=subtitle, bg='#FFFFFF', fg='#333333',
+                 font=('Microsoft JhengHei UI', 12)).pack(anchor='w', pady=(5, 0))
+
+        add_button = tk.Button(
+            header, text='新增生產記錄', command=lambda: edit_record(None),
+            font=('Microsoft JhengHei UI', 12, 'bold'), bg='#FFFFFF', fg='#111111',
+            activebackground='#F5F5F5', relief='solid', bd=1, padx=18, pady=8, cursor='hand2'
+        )
+        add_button.pack(side='right', anchor='n')
+
+        # ---------- Summary cards ----------
+        summary = tk.Frame(outer, bg='#FFFFFF')
+        summary.pack(fill='x', padx=28, pady=(8, 22))
+        summary.grid_columnconfigure(0, weight=1)
+        summary.grid_columnconfigure(1, weight=1)
+
+        def make_card(parent: tk.Misc, col: int, heading: str) -> tuple[tk.Frame, tk.Label, tk.Label]:
+            card = tk.Frame(parent, bg='#FFFFFF', bd=1, relief='solid', highlightthickness=0)
+            card.grid(row=0, column=col, sticky='nsew', padx=(0, 10) if col == 0 else (10, 0), ipadx=18, ipady=16)
+            tk.Label(card, text=heading, bg='#FFFFFF', fg='#333333',
+                     font=('Microsoft JhengHei UI', 12)).pack(anchor='w', padx=20, pady=(14, 0))
+            value_label = tk.Label(card, text='0', bg='#FFFFFF', fg='#111111',
+                                   font=('Microsoft JhengHei UI', 22, 'bold'))
+            value_label.pack(anchor='w', padx=20, pady=(5, 0))
+            detail_label = tk.Label(card, text='', bg='#FFFFFF', fg='#333333',
+                                    font=('Microsoft JhengHei UI', 11))
+            detail_label.pack(anchor='w', padx=20, pady=(0, 12))
+            return card, value_label, detail_label
+
+        _, total_value, total_detail = make_card(summary, 0, '記錄總數')
+        _, latest_value, latest_detail = make_card(summary, 1, '最新下單數量')
+
+        # ---------- History section ----------
+        section = tk.Frame(outer, bg='#FFFFFF')
+        section.pack(fill='both', expand=True, padx=28, pady=(0, 14))
+
+        section_top = tk.Frame(section, bg='#FFFFFF')
+        section_top.pack(fill='x', pady=(0, 14))
+        section_title = tk.Label(section_top, text='生產歷程', bg='#FFFFFF', fg='#111111',
+                                 font=('Microsoft JhengHei UI', 15, 'bold'))
+        section_title.pack(side='left')
+        manage_button = tk.Button(
+            section_top, text='管理欄位', command=lambda: manage_columns(),
+            font=('Microsoft JhengHei UI', 11), bg='#FFFFFF', fg='#111111',
+            activebackground='#F5F5F5', relief='solid', bd=1, padx=14, pady=6, cursor='hand2'
+        )
+        manage_button.pack(side='right')
+
+        table_wrap = tk.Frame(section, bg='#FFFFFF', bd=1, relief='solid')
+        table_wrap.pack(fill='both', expand=True)
+        table = ttk.Treeview(table_wrap, show='headings', selectmode='browse')
+        yscroll = ttk.Scrollbar(table_wrap, orient='vertical', command=table.yview)
+        table.configure(yscrollcommand=yscroll.set)
+        table.grid(row=0, column=0, sticky='nsew')
+        yscroll.grid(row=0, column=1, sticky='ns')
+        table_wrap.rowconfigure(0, weight=1)
+        table_wrap.columnconfigure(0, weight=1)
+
+        # 使用獨立樣式，讓生產履歷表格更接近 Prototype。
+        pstyle = ttk.Style(win)
+        try:
+            pstyle.configure('Production.Treeview', font=('Microsoft JhengHei UI', 11), rowheight=46,
+                             borderwidth=0, relief='flat')
+            pstyle.configure('Production.Treeview.Heading', font=('Microsoft JhengHei UI', 11, 'bold'),
+                             padding=(8, 12), relief='flat')
+        except tk.TclError:
+            pass
+        table.configure(style='Production.Treeview')
+
+        all_data_columns = ('date', 'order', 'stock', 'manufacturer', 'remark')
+        headings = {
+            'date': ('生產日期', 150, 'center'),
+            'order': ('下單數量', 135, 'center'),
+            'stock': ('入庫數量', 135, 'center'),
+            'manufacturer': ('製作廠商', 205, 'w'),
+            'remark': ('備註', 1, 'w'),
+        }
+
+        def configure_columns() -> None:
+            visible = list(self.production_display_settings.get('production_visible_columns', all_data_columns))
+            visible = [key for key in all_data_columns if key in visible]
+            table_columns = ('seq', *visible, 'actions')
+            table['columns'] = table_columns
+            table.heading('seq', text='序號', anchor='center')
+            table.column('seq', width=72, minwidth=60, anchor='center', stretch=False)
+            for key in visible:
+                text, width, anchor = headings[key]
+                table.heading(key, text=text, anchor='center')
+                table.column(key, width=width, minwidth=160 if key == 'remark' else 90,
+                             anchor=anchor, stretch=(key == 'remark'))
+            table.heading('actions', text='操作', anchor='center')
+            table.column('actions', width=150, minwidth=130, anchor='center', stretch=False)
+
+        self.production_display_settings = self.db.get_display_settings()
+        configure_columns()
+
+        def selected_id() -> int | None:
+            sel = table.selection()
+            return int(sel[0]) if sel else None
+
+        def refresh() -> None:
+            rows = self.db.production_records(record_id)
+            total_value.config(text=f'{len(rows):,}')
+            total_detail.config(text='筆生產記錄')
+            if rows:
+                latest = rows[0]
+                latest_text = str(latest['order_quantity'] or latest['quantity'] or '').strip()
+                numeric_latest = latest_text.replace(',', '')
+                if numeric_latest.isdigit():
+                    latest_text = f'{int(numeric_latest):,}'
+                latest_value.config(text=latest_text or '0')
+                latest_detail.config(text=str(latest['production_date'] or ''))
+            else:
+                latest_value.config(text='0')
+                latest_detail.config(text='尚無資料')
+            section_title.config(text=f'生產歷程 {len(rows)} 筆記錄')
+            table.delete(*table.get_children())
+            visible = list(self.production_display_settings.get('production_visible_columns', all_data_columns))
+            for index, row in enumerate(rows, start=1):
+                data = {
+                    'date': str(row['production_date'] or ''),
+                    'order': str(row['order_quantity'] or row['quantity'] or ''),
+                    'stock': str(row['stock_quantity'] or ''),
+                    'manufacturer': str(row['manufacturer'] or ''),
+                    'remark': str(row['remark'] or ''),
+                }
+                row_values = [f'{index:02d}'] + [data[key] for key in all_data_columns if key in visible] + ['✎   🗑']
+                table.insert('', 'end', iid=str(row['id']), values=row_values)
+            self.refresh_data()
+
+        def edit_record(existing_id: int | None = None) -> None:
+            old = None
+            if existing_id is not None:
+                old = next((r for r in self.db.production_records(record_id) if int(r['id']) == existing_id), None)
+            dialog = tk.Toplevel(win)
+            dialog.title('新增生產記錄' if old is None else '編輯生產記錄')
+            dialog.resizable(False, False)
+            body = tk.Frame(dialog, bg='#FFFFFF', padx=22, pady=20)
+            body.pack(fill='both', expand=True)
+            vars_ = {
+                'date': tk.StringVar(value='' if old is None else old['production_date']),
+                'order': tk.StringVar(value='' if old is None else (old['order_quantity'] or old['quantity'])),
+                'stock': tk.StringVar(value='' if old is None else old['stock_quantity']),
+                'manufacturer': tk.StringVar(value='' if old is None else old['manufacturer']),
+                'remark': tk.StringVar(value='' if old is None else old['remark']),
+            }
+            labels = [('date', '生產日期'), ('order', '下單數量'), ('stock', '入庫數量'), ('manufacturer', '製作廠商'), ('remark', '備註')]
+            for row_idx, (key, label) in enumerate(labels):
+                tk.Label(body, text=label, bg='#FFFFFF', fg='#222222',
+                         font=('Microsoft JhengHei UI', 10)).grid(row=row_idx, column=0, sticky='w', padx=(0, 14), pady=7)
+                tk.Entry(body, textvariable=vars_[key], width=46,
+                         font=('Microsoft JhengHei UI', 10)).grid(row=row_idx, column=1, sticky='ew', pady=7)
+            buttons = tk.Frame(body, bg='#FFFFFF')
+            buttons.grid(row=len(labels), column=0, columnspan=2, sticky='e', pady=(12, 0))
+
+            def save() -> None:
+                try:
+                    if not vars_['date'].get().strip():
+                        messagebox.showwarning('生產記錄', '請輸入生產日期。', parent=dialog)
+                        return
+                    if old is None:
+                        self.db.create_production_record(record_id, vars_['date'].get(), vars_['order'].get(), vars_['stock'].get(), vars_['manufacturer'].get(), vars_['remark'].get())
+                    else:
+                        self.db.update_production_record(existing_id, vars_['date'].get(), vars_['order'].get(), vars_['stock'].get(), vars_['manufacturer'].get(), vars_['remark'].get())
+                    dialog.destroy()
+                    refresh()
+                except Exception as exc:
+                    messagebox.showerror('生產記錄', str(exc), parent=dialog)
+
+            tk.Button(buttons, text='取消', command=dialog.destroy, font=('Microsoft JhengHei UI', 10), padx=12, pady=4).pack(side='right', padx=(8, 0))
+            tk.Button(buttons, text='儲存', command=save, font=('Microsoft JhengHei UI', 10, 'bold'), padx=12, pady=4).pack(side='right')
+            dialog.transient(win)
+            dialog.grab_set()
+            dialog.focus_set()
+
+        def edit_selected() -> None:
+            pid = selected_id()
+            if pid is None:
+                messagebox.showwarning('生產記錄', '請先選取一筆生產記錄。', parent=win)
+                return
+            edit_record(pid)
+
+        def delete_selected() -> None:
+            pid = selected_id()
+            if pid is None:
+                messagebox.showwarning('生產記錄', '請先選取一筆生產記錄。', parent=win)
+                return
+            if messagebox.askyesno('刪除生產記錄', '確定要刪除選取的生產記錄嗎？', parent=win):
+                self.db.delete_production_record(pid)
+                refresh()
+
+        def manage_columns() -> None:
+            dialog = tk.Toplevel(win)
+            dialog.title('管理生產履歷欄位')
+            dialog.resizable(False, False)
+            body = tk.Frame(dialog, bg='#FFFFFF', padx=22, pady=18)
+            body.pack(fill='both', expand=True)
+            tk.Label(body, text='選擇要顯示的欄位', bg='#FFFFFF', fg='#111111',
+                     font=('Microsoft JhengHei UI', 12, 'bold')).pack(anchor='w', pady=(0, 10))
+            labels = {'date': '生產日期', 'order': '下單數量', 'stock': '入庫數量', 'manufacturer': '製作廠商', 'remark': '備註'}
+            current = set(self.production_display_settings.get('production_visible_columns', all_data_columns))
+            vars_ = {}
+            for key in all_data_columns:
+                var = tk.BooleanVar(value=key in current)
+                vars_[key] = var
+                tk.Checkbutton(body, text=labels[key], variable=var, bg='#FFFFFF', anchor='w',
+                                font=('Microsoft JhengHei UI', 10)).pack(fill='x', pady=3)
+            buttons = tk.Frame(body, bg='#FFFFFF')
+            buttons.pack(fill='x', pady=(14, 0))
+
+            def save_columns() -> None:
+                selected = [key for key in all_data_columns if vars_[key].get()]
+                if not selected:
+                    messagebox.showwarning('管理欄位', '至少要保留一個欄位。', parent=dialog)
+                    return
+                self.production_display_settings['production_visible_columns'] = selected
+                self.db.save_display_settings(self.production_display_settings)
+                configure_columns()
+                dialog.destroy()
+                refresh()
+
+            tk.Button(buttons, text='取消', command=dialog.destroy, padx=12, pady=4).pack(side='right', padx=(8, 0))
+            tk.Button(buttons, text='儲存', command=save_columns, font=('Microsoft JhengHei UI', 10, 'bold'), padx=12, pady=4).pack(side='right')
+            dialog.transient(win)
+            dialog.grab_set()
+            dialog.focus_set()
+
+        def table_click(event: Any) -> None:
+            region = table.identify('region', event.x, event.y)
+            if region != 'cell':
+                return
+            row_id = table.identify_row(event.y)
+            col = table.identify_column(event.x)
+            if not row_id:
+                return
+            current_columns = list(table['columns'])
+            if col == f"#{current_columns.index('actions') + 1}":
+                # 操作欄：左半編輯、右半刪除。
+                bbox = table.bbox(row_id, 'actions')
+                if bbox:
+                    local_x = event.x - bbox[0]
+                    if local_x < bbox[2] / 2:
+                        edit_record(int(row_id))
+                    else:
+                        if messagebox.askyesno('刪除生產記錄', '確定要刪除選取的生產記錄嗎？', parent=win):
+                            self.db.delete_production_record(int(row_id))
+                            refresh()
+
+        # 底部說明列與關閉按鈕
+        footer = tk.Frame(outer, bg='#FFFFFF', bd=0)
+        footer.pack(fill='x', padx=28, pady=(4, 18))
+        tk.Label(footer, text='註：點擊「新增生產記錄」可新增一筆生產記錄；點擊鉛筆可編輯該筆記錄；點擊垃圾桶可刪除該筆記錄。',
+                 bg='#FFFFFF', fg='#333333', font=('Microsoft JhengHei UI', 9)).pack(side='left')
+        tk.Button(footer, text='關閉', command=win.destroy, font=('Microsoft JhengHei UI', 11, 'bold'),
+                  bg='#FFFFFF', fg='#111111', activebackground='#F5F5F5', relief='solid', bd=1,
+                  padx=18, pady=7, cursor='hand2').pack(side='right')
+
+        table.bind('<Button-1>', table_click, add='+')
+        table.bind('<Double-1>', lambda _event: edit_selected())
+        win.protocol('WM_DELETE_WINDOW', win.destroy)
+        refresh()
+        win.grab_set()
+    def edit_link(self, parent: tk.Misc, link_var: tk.StringVar) -> None:
+        dialog = LinkDialog(parent, link_var.get())
+        self.wait_window(dialog)
+        if dialog.result is not None:
+            link_var.set(dialog.result)
+
+    @staticmethod
+    def open_link(url: str) -> None:
+        url = url.strip()
+        if not url:
+            return
+        import os
+        import webbrowser
+        try:
+            webbrowser.open(url)
+        except Exception:
+            if sys.platform.startswith('win'):
+                os.startfile(url)  # type: ignore[attr-defined]
+
+    def add_field(self) -> None:
+        dialog = FieldDialog(self, self.db)
+        self.wait_window(dialog)
+        if dialog.result:
+            self.refresh_all()
+
+    def edit_selected_field(self) -> None:
+        field_id = self._selected_id(self.fields_tree)
+        if field_id is None:
+            messagebox.showwarning('欄位管理', '請先選取欄位。', parent=self)
+            return
+        field = self.db.get_field(field_id)
+        if field is None:
+            return
+        dialog = FieldDialog(self, self.db, field)
+        self.wait_window(dialog)
+        if dialog.result:
+            self.refresh_all()
+
+    def edit_category_colors(self) -> None:
+        field = next((field for field in self.db.list_fields() if field['system_key'] == 'formulation'), None)
+        if field is None:
+            messagebox.showinfo('欄位管理', '目前沒有劑型欄位。', parent=self)
+            return
+        options = json.loads(field['options_json'] or '[]')
+        colors = json.loads(field['color_map_json'] or '{}')
+        dialog = ColorDialog(self, self.db, int(field['id']), options, colors)
+        self.wait_window(dialog)
+        self.refresh_all()
+
+    def add_lookup(self) -> None:
+        dialog = LookupDialog(self, '新增代碼／名稱對照')
+        self.wait_window(dialog)
+        if dialog.result:
+            try:
+                self.db.add_lookup(*dialog.result)
+                self.refresh_all()
+            except ValueError as exc:
+                messagebox.showerror('代碼／名稱對照', str(exc), parent=self)
+
+    def edit_selected_lookup(self) -> None:
+        lookup_id = self._selected_id(self.lookup_tree)
+        if lookup_id is None:
+            messagebox.showwarning('代碼／名稱對照', '請先選取一筆對照資料。', parent=self)
+            return
+        row = next((row for row in self.db.lookup_pairs() if int(row['id']) == lookup_id), None)
+        if row is None:
+            return
+        dialog = LookupDialog(self, '編輯代碼／名稱對照', row['code'], row['term'])
+        self.wait_window(dialog)
+        if dialog.result:
+            try:
+                self.db.update_lookup(lookup_id, *dialog.result)
+                self.refresh_all()
+            except ValueError as exc:
+                messagebox.showerror('代碼／名稱對照', str(exc), parent=self)
+
+    def delete_selected_lookup(self) -> None:
+        lookup_id = self._selected_id(self.lookup_tree)
+        if lookup_id is None:
+            messagebox.showwarning('代碼／名稱對照', '請先選取一筆對照資料。', parent=self)
+            return
+        if messagebox.askyesno('刪除對照', '刪除後，已使用此代碼的資料仍會保留，但名稱不會再自動更新。確定刪除嗎？', parent=self):
+            self.db.delete_lookup(lookup_id)
+            self.refresh_all()
+
+    def backup_now(self) -> None:
+        try:
+            target = self.db.backup()
+            messagebox.showinfo('備份完成', f'備份檔已建立：\n{target}', parent=self)
+        except Exception as exc:
+            messagebox.showerror('備份失敗', str(exc), parent=self)
+
+    def backup_as(self) -> None:
+        target = filedialog.asksaveasfilename(title='另存資料庫備份', defaultextension='.db', filetypes=[('SQLite 資料庫', '*.db'), ('所有檔案', '*.*')])
+        if not target:
+            return
+        try:
+            self.db.backup(Path(target))
+            messagebox.showinfo('備份完成', f'已儲存至：\n{target}', parent=self)
+        except Exception as exc:
+            messagebox.showerror('備份失敗', str(exc), parent=self)
+
+    def restore_backup(self) -> None:
+        source = filedialog.askopenfilename(title='選擇資料庫備份', filetypes=[('SQLite 資料庫', '*.db'), ('所有檔案', '*.*')])
+        if not source:
+            return
+        if not messagebox.askyesno('還原資料庫', '還原會覆蓋目前資料，確定繼續嗎？', parent=self):
+            return
+        try:
+            self.db.restore(Path(source))
+            self.refresh_all()
+            messagebox.showinfo('還原完成', '資料庫已還原。', parent=self)
+        except Exception as exc:
+            messagebox.showerror('還原失敗', str(exc), parent=self)
+
+    def _on_close(self) -> None:
+        self._save_current_column_widths()
+        self.db.close()
+        self.destroy()
+
+
+def self_test() -> None:
+    source = app_dir() / DEFAULT_XLSX
+    with tempfile.TemporaryDirectory(prefix='offline_excel_db_test_') as temp_dir:
+        db = Database(Path(temp_dir))
+        field_count, record_count = db.import_excel(source, replace=True)
+        assert field_count == 15, field_count
+        assert record_count == 3, record_count
+        fields = db.list_fields()
+        assert len(fields) == 15
+        by_name = {field['name']: field for field in fields}
+        by_key = {field['system_key']: field for field in fields if field['system_key']}
+        assert by_key['formulation_term']['kind'] == 'computed'
+        assert db.get_record_values(1)[int(by_key['formulation_term']['id'])] == '水溶性粒劑'
+
+        # 所有內建欄位名稱都可以改名；連動功能使用 system_key，不依賴顯示名稱。
+        db.rename_field(int(by_key['approval']['id']), '核准狀態')
+        db.rename_field(int(by_key['formulation']['id']), '劑型分類')
+        db.rename_field(int(by_key['formulation_code']['id']), '劑型代碼')
+        db.rename_field(int(by_key['formulation_term']['id']), '劑型中文名稱')
+        renamed_fields = {field['system_key']: field for field in db.list_fields() if field['system_key']}
+        assert db.get_field(int(renamed_fields['approval']['id']))['name'] == '核准狀態'
+        custom_id = db.add_field('測試欄位', 'dropdown', ['甲', '乙'])
+        new_id = db.create_record({custom_id: '乙'})
+        assert db.get_record_values(new_id)[custom_id] == '乙'
+        db.update_record(new_id, {int(renamed_fields['formulation_code']['id']): 'SC'})
+        assert db.get_record_values(new_id)[int(renamed_fields['formulation_term']['id'])] == '水懸劑'
+        backup_path = db.backup(Path(temp_dir) / 'backup.db')
+        assert backup_path.exists()
+        db.close()
+        print(f'SELF_TEST_OK fields={field_count} records={record_count} custom_record={new_id}')
+
+
+def main() -> None:
+    if '--self-test' in sys.argv:
+        self_test()
+        return
+    root = app_dir()
+    db = Database(root)
+    try:
+        if not db.has_data():
+            source = root / DEFAULT_XLSX
+            if source.exists():
+                db.import_excel(source, replace=False)
+        app = OfflineDatabaseApp(db)
+        app.mainloop()
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+if __name__ == '__main__':
+    main()
