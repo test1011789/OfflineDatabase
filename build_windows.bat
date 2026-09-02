@@ -1,4 +1,4 @@
-﻿@echo off
+@echo off
 setlocal EnableExtensions
 
 cd /d "%~dp0"
@@ -46,6 +46,7 @@ if not exist initial_data.xlsx (
 
 echo.
 echo [4/5] Building Windows Portable EXE...
+echo UPX compression disabled for a more conservative Windows security profile.
 set "ICON_ARG="
 if exist OfflineDatabase.ico (
     echo Custom icon found: OfflineDatabase.ico
@@ -54,7 +55,7 @@ if exist OfflineDatabase.ico (
     echo No OfflineDatabase.ico found. Building with the default icon.
 )
 
-python -m PyInstaller --noconfirm --clean --windowed --onedir --name OfflineDatabase %ICON_ARG% app.py
+python -m PyInstaller --noconfirm --clean --noupx --windowed --onedir --name OfflineDatabase %ICON_ARG% app.py
 if errorlevel 1 goto :error
 
 echo.
