@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import tkinter as tk
-from tkinter import colorchooser, filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 
 from openpyxl import load_workbook
 
@@ -524,6 +524,36 @@ class Database:
         if self.conn.execute('SELECT 1 FROM companies WHERE name = ? AND id <> ?', (name, int(company_id))).fetchone():
             raise ValueError('公司名稱已存在。')
         self.conn.execute('UPDATE companies SET name = ? WHERE id = ?', (name, int(company_id)))
+        self.conn.commit()
+
+    def add_company(self, name: str) -> int:
+        name = name.strip()
+        if not name:
+            raise ValueError('公司名稱不可空白。')
+        if self.conn.execute('SELECT 1 FROM companies WHERE name = ?', (name,)).fetchone():
+            raise ValueError('公司名稱已存在。')
+        row = self.conn.execute('SELECT COALESCE(MAX(position), -1) + 1 AS next_position FROM companies').fetchone()
+        position = int(row['next_position'])
+        cursor = self.conn.execute('INSERT INTO companies(name, position) VALUES (?, ?)', (name, position))
+        self.conn.commit()
+        return int(cursor.lastrowid)
+
+    def delete_company(self, company_id: int) -> None:
+        company_id = int(company_id)
+        company = self.conn.execute('SELECT name FROM companies WHERE id = ?', (company_id,)).fetchone()
+        if not company:
+            raise ValueError('找不到要刪除的公司。')
+        count = self.conn.execute('SELECT COUNT(*) AS n FROM companies').fetchone()['n']
+        if int(count) <= 1:
+            raise ValueError('至少要保留一家公司，無法刪除最後一家公司。')
+        record_count = self.conn.execute('SELECT COUNT(*) AS n FROM records WHERE company_id = ?', (company_id,)).fetchone()['n']
+        manufacturer_count = self.conn.execute('SELECT COUNT(*) AS n FROM production_manufacturers WHERE company_id = ?', (company_id,)).fetchone()['n']
+        if int(record_count) or int(manufacturer_count):
+            raise ValueError(f'「{company["name"]}」仍有資料，為避免誤刪，公司內還有 {int(record_count)} 筆主資料與 {int(manufacturer_count)} 個廠商，請先清空後再刪除。')
+        position_row = self.conn.execute('SELECT position FROM companies WHERE id = ?', (company_id,)).fetchone()
+        position = int(position_row['position'])
+        self.conn.execute('DELETE FROM companies WHERE id = ?', (company_id,))
+        self.conn.execute('UPDATE companies SET position = position - 1 WHERE position > ?', (position,))
         self.conn.commit()
 
     def create_record(self, values: dict[int, Any], company_id: int | None = None) -> int:
@@ -1128,7 +1158,7 @@ class OfflineDatabaseApp(tk.Tk):
             if int(company['id']) == self.current_company_id:
                 self.company_notebook.select(idx)
                 break
-        ttk.Button(company_bar, text='編輯公司名稱', command=self.edit_company_names).pack(side='left', padx=10)
+        ttk.Button(company_bar, text='公司管理', command=self.manage_companies).pack(side='left', padx=10)
         ttk.Label(company_bar, text='目前公司：', style='Hint.TLabel').pack(side='left', padx=(8, 0))
         self.company_label_var = tk.StringVar()
         ttk.Label(company_bar, textvariable=self.company_label_var, font=('Microsoft JhengHei UI', 10, 'bold')).pack(side='left', padx=(4, 0))
@@ -1182,34 +1212,107 @@ class OfflineDatabaseApp(tk.Tk):
                 self.refresh_data()
                 self.status_var.set(f'目前公司：{companies[index]["name"]}')
 
-    def edit_company_names(self) -> None:
-        companies = self.db.companies()
+    def manage_companies(self) -> None:
         dialog = tk.Toplevel(self)
-        dialog.title('編輯公司名稱')
+        dialog.title('公司管理')
+        dialog.geometry('520x390')
         dialog.resizable(False, False)
-        body = ttk.Frame(dialog, padding=18)
-        body.pack(fill='both', expand=True)
-        vars_: list[tuple[int, tk.StringVar]] = []
-        for row, company in enumerate(companies):
-            ttk.Label(body, text=f'公司 {row + 1}').grid(row=row, column=0, sticky='w', padx=(0, 12), pady=6)
-            var = tk.StringVar(value=str(company['name']))
-            ttk.Entry(body, textvariable=var, width=34).grid(row=row, column=1, sticky='ew', pady=6)
-            vars_.append((int(company['id']), var))
-        def save():
-            try:
-                names = [v.get().strip() for _, v in vars_]
-                if any(not n for n in names) or len(names) != len(set(names)):
-                    raise ValueError('公司名稱不可空白，且不可重複。')
-                for company_id, var in vars_:
-                    self.db.rename_company(company_id, var.get())
-                dialog.destroy()
-                self._rebuild_company_tabs()
-            except ValueError as exc:
-                messagebox.showerror('公司設定', str(exc), parent=dialog)
-        ttk.Button(body, text='儲存', command=save).grid(row=len(vars_), column=0, pady=(14, 0))
-        ttk.Button(body, text='取消', command=dialog.destroy).grid(row=len(vars_), column=1, sticky='e', pady=(14, 0))
         dialog.transient(self)
         dialog.grab_set()
+
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill='both', expand=True)
+        ttk.Label(body, text='公司管理', style='Title.TLabel').pack(anchor='w')
+        ttk.Label(body, text='可新增、修改或刪除公司。刪除公司前，必須先清空該公司的資料。', style='Hint.TLabel').pack(anchor='w', pady=(4, 12))
+
+        list_frame = ttk.Frame(body)
+        list_frame.pack(fill='both', expand=True)
+        company_tree = ttk.Treeview(list_frame, columns=('name', 'count'), show='headings', height=9, selectmode='browse')
+        company_tree.heading('name', text='公司名稱')
+        company_tree.heading('count', text='主資料筆數')
+        company_tree.column('name', width=300, anchor='w')
+        company_tree.column('count', width=120, anchor='center')
+        scrollbar = ttk.Scrollbar(list_frame, orient='vertical', command=company_tree.yview)
+        company_tree.configure(yscrollcommand=scrollbar.set)
+        company_tree.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+
+        def reload_list(select_id: int | None = None):
+            for item in company_tree.get_children():
+                company_tree.delete(item)
+            for company in self.db.companies():
+                cid = int(company['id'])
+                count = self.db.conn.execute('SELECT COUNT(*) AS n FROM records WHERE company_id = ?', (cid,)).fetchone()['n']
+                company_tree.insert('', 'end', iid=str(cid), values=(str(company['name']), int(count)))
+            if select_id is not None and company_tree.exists(str(select_id)):
+                company_tree.selection_set(str(select_id))
+                company_tree.focus(str(select_id))
+
+        def selected_company():
+            selected = company_tree.selection()
+            if not selected:
+                messagebox.showinfo('公司管理', '請先選擇一家公司。', parent=dialog)
+                return None
+            cid = int(selected[0])
+            row = self.db.conn.execute('SELECT id, name FROM companies WHERE id = ?', (cid,)).fetchone()
+            return row
+
+        def add_company():
+            name = simpledialog.askstring('新增公司', '請輸入公司名稱：', parent=dialog)
+            if name is None:
+                return
+            try:
+                cid = self.db.add_company(name)
+                self.current_company_id = cid
+                self._rebuild_company_tabs()
+                reload_list(cid)
+            except ValueError as exc:
+                messagebox.showerror('新增公司', str(exc), parent=dialog)
+
+        def rename_selected():
+            row = selected_company()
+            if not row:
+                return
+            name = simpledialog.askstring('修改公司名稱', '請輸入新的公司名稱：', initialvalue=str(row['name']), parent=dialog)
+            if name is None:
+                return
+            try:
+                self.db.rename_company(int(row['id']), name)
+                self._rebuild_company_tabs()
+                reload_list(int(row['id']))
+            except ValueError as exc:
+                messagebox.showerror('修改公司名稱', str(exc), parent=dialog)
+
+        def delete_selected():
+            row = selected_company()
+            if not row:
+                return
+            cid = int(row['id'])
+            name = str(row['name'])
+            if not messagebox.askyesno('刪除公司', f'確定要刪除「{name}」嗎？\n\n只有完全沒有資料的公司才能刪除。', parent=dialog):
+                return
+            try:
+                self.db.delete_company(cid)
+                if self.current_company_id == cid:
+                    self.current_company_id = self.db.default_company_id()
+                self._rebuild_company_tabs()
+                reload_list(self.current_company_id)
+            except ValueError as exc:
+                messagebox.showerror('刪除公司', str(exc), parent=dialog)
+
+        buttons = ttk.Frame(body)
+        buttons.pack(fill='x', pady=(12, 0))
+        ttk.Button(buttons, text='新增公司', command=add_company).pack(side='left')
+        ttk.Button(buttons, text='修改名稱', command=rename_selected).pack(side='left', padx=6)
+        ttk.Button(buttons, text='刪除公司', command=delete_selected).pack(side='left')
+        ttk.Button(buttons, text='關閉', command=dialog.destroy).pack(side='right')
+
+        reload_list(self.current_company_id)
+        dialog.wait_window()
+
+    def edit_company_names(self) -> None:
+        # 舊方法名稱保留，避免其他舊程式碼呼叫時失效。
+        self.manage_companies()
 
     def _rebuild_company_tabs(self) -> None:
         if not self.company_notebook:
@@ -1219,7 +1322,11 @@ class OfflineDatabaseApp(tk.Tk):
             frame = self.company_notebook.nametowidget(tab)
             self.company_notebook.forget(tab)
             frame.destroy()
-        for company in self.db.companies():
+        companies = self.db.companies()
+        if not any(int(company['id']) == current_id for company in companies):
+            current_id = self.db.default_company_id()
+            self.current_company_id = current_id
+        for company in companies:
             frame = ttk.Frame(self.company_notebook)
             self.company_notebook.add(frame, text=str(company['name']))
         companies = self.db.companies()
