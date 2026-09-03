@@ -157,11 +157,14 @@ class Database:
                 stock_quantity TEXT NOT NULL DEFAULT '',
                 manufacturer TEXT NOT NULL DEFAULT '',
                 remark TEXT NOT NULL DEFAULT '',
+                external_url TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (record_id) REFERENCES records(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_production_records_record_id ON production_records(record_id);
+            CREATE INDEX IF NOT EXISTS idx_production_records_record_date ON production_records(record_id, production_date DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_production_records_manufacturer ON production_records(manufacturer);
             CREATE TABLE IF NOT EXISTS production_manufacturers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
@@ -182,6 +185,8 @@ class Database:
             self.conn.execute("ALTER TABLE production_records ADD COLUMN stock_quantity TEXT NOT NULL DEFAULT ''")
         if 'manufacturer' not in production_columns:
             self.conn.execute("ALTER TABLE production_records ADD COLUMN manufacturer TEXT NOT NULL DEFAULT ''")
+        if 'external_url' not in production_columns:
+            self.conn.execute("ALTER TABLE production_records ADD COLUMN external_url TEXT NOT NULL DEFAULT ''")
         # 舊版的「quantity」資料視為下單數量，讓既有資料不會消失。
         self.conn.execute("UPDATE production_records SET order_quantity = quantity WHERE TRIM(order_quantity) = '' AND TRIM(quantity) <> ''")
         existing_manufacturers = [
@@ -508,35 +513,51 @@ class Database:
             })
         return result
 
-    def production_records(self, record_id: int) -> list[sqlite3.Row]:
-        return list(self.conn.execute(
-            'SELECT * FROM production_records WHERE record_id = ? ORDER BY production_date DESC, id DESC',
-            (int(record_id),),
-        ))
+    @staticmethod
+    def _production_mismatch_sql() -> str:
+        order_expr = "REPLACE(TRIM(COALESCE(order_quantity, quantity, '')), ',', '')"
+        stock_expr = "REPLACE(TRIM(COALESCE(stock_quantity, '')), ',', '')"
+        return f"(({order_expr} <> {stock_expr}) AND NOT ({order_expr} = '' AND {stock_expr} = ''))"
 
-    def production_record_count(self, record_id: int) -> int:
-        return int(self.conn.execute(
-            'SELECT COUNT(*) FROM production_records WHERE record_id = ?', (int(record_id),)
-        ).fetchone()[0])
+    def production_records(self, record_id: int, limit: int | None = None, offset: int = 0, abnormal_only: bool = False) -> list[sqlite3.Row]:
+        sql = 'SELECT * FROM production_records WHERE record_id = ?'
+        params: list[Any] = [int(record_id)]
+        if abnormal_only:
+            sql += ' AND ' + self._production_mismatch_sql()
+        sql += ' ORDER BY production_date DESC, id DESC'
+        if limit is not None:
+            sql += ' LIMIT ? OFFSET ?'
+            params.extend([max(1, int(limit)), max(0, int(offset))])
+        return list(self.conn.execute(sql, tuple(params)))
 
-    def create_production_record(self, record_id: int, production_date: str = '', order_quantity: str = '', stock_quantity: str = '', manufacturer: str = '', remark: str = '', batch_no: str = '') -> int:
+    def production_record(self, production_id: int) -> sqlite3.Row | None:
+        return self.conn.execute('SELECT * FROM production_records WHERE id = ?', (int(production_id),)).fetchone()
+
+    def production_record_count(self, record_id: int, abnormal_only: bool = False) -> int:
+        sql = 'SELECT COUNT(*) FROM production_records WHERE record_id = ?'
+        params: list[Any] = [int(record_id)]
+        if abnormal_only:
+            sql += ' AND ' + self._production_mismatch_sql()
+        return int(self.conn.execute(sql, tuple(params)).fetchone()[0])
+
+    def create_production_record(self, record_id: int, production_date: str = '', order_quantity: str = '', stock_quantity: str = '', manufacturer: str = '', remark: str = '', batch_no: str = '', external_url: str = '') -> int:
         if not self.conn.execute('SELECT 1 FROM records WHERE id = ?', (int(record_id),)).fetchone():
             raise ValueError('找不到對應的主資料。')
         now = datetime.now().isoformat(timespec='seconds')
         cursor = self.conn.execute(
-            '''INSERT INTO production_records(record_id, production_date, batch_no, quantity, order_quantity, stock_quantity, manufacturer, remark, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-            (int(record_id), production_date.strip(), batch_no.strip(), order_quantity.strip(), order_quantity.strip(), stock_quantity.strip(), manufacturer.strip(), remark.strip(), now, now),
+            '''INSERT INTO production_records(record_id, production_date, batch_no, quantity, order_quantity, stock_quantity, manufacturer, remark, external_url, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (int(record_id), production_date.strip(), batch_no.strip(), order_quantity.strip(), order_quantity.strip(), stock_quantity.strip(), manufacturer.strip(), remark.strip(), external_url.strip(), now, now),
         )
         self.conn.commit()
         return int(cursor.lastrowid)
 
-    def update_production_record(self, production_id: int, production_date: str, order_quantity: str, stock_quantity: str, manufacturer: str, remark: str, batch_no: str = '') -> None:
+    def update_production_record(self, production_id: int, production_date: str, order_quantity: str, stock_quantity: str, manufacturer: str, remark: str, batch_no: str = '', external_url: str = '') -> None:
         self.conn.execute(
             '''UPDATE production_records
-               SET production_date = ?, batch_no = ?, quantity = ?, order_quantity = ?, stock_quantity = ?, manufacturer = ?, remark = ?, updated_at = ?
+               SET production_date = ?, batch_no = ?, quantity = ?, order_quantity = ?, stock_quantity = ?, manufacturer = ?, remark = ?, external_url = ?, updated_at = ?
                WHERE id = ?''',
-            (production_date.strip(), batch_no.strip(), order_quantity.strip(), order_quantity.strip(), stock_quantity.strip(), manufacturer.strip(), remark.strip(), datetime.now().isoformat(timespec='seconds'), int(production_id)),
+            (production_date.strip(), batch_no.strip(), order_quantity.strip(), order_quantity.strip(), stock_quantity.strip(), manufacturer.strip(), remark.strip(), external_url.strip(), datetime.now().isoformat(timespec='seconds'), int(production_id)),
         )
         self.conn.commit()
 
@@ -1525,7 +1546,7 @@ class OfflineDatabaseApp(tk.Tk):
         return brand_name or permit_no or f'資料 #{record_id}'
 
     def open_production_records(self, record_id: int) -> None:
-        """開啟單一成品的生產履歷視窗。控制項統一沿用主介面的 ttk / Vista 風格。"""
+        """開啟單一成品的生產履歷視窗。"""
         product_name = self._record_display_name(record_id)
         fields = self.db.list_fields()
         values = self.db.get_record_values(record_id)
@@ -1536,18 +1557,15 @@ class OfflineDatabaseApp(tk.Tk):
 
         formulation = field_value('formulation')
         content = field_value('content')
-
         win = tk.Toplevel(self)
         win.title(f'生產記錄 - {product_name}')
-        win.geometry('1180x760')
-        win.minsize(980, 650)
+        win.geometry('1200x780')
+        win.minsize(1000, 680)
         win.transient(self)
         try:
             win.iconphoto(True, self._blank_window_icon)
         except Exception:
             pass
-
-        # 直接使用主程式已建立的 ttk.Style，讓按鈕、輸入框、表格與主介面一致。
         try:
             style = ttk.Style(win)
             style.configure('ProductionTitle.TLabel', font=('Microsoft JhengHei UI', FIXED_UI_FONT_SIZE + 8, 'bold'))
@@ -1561,352 +1579,126 @@ class OfflineDatabaseApp(tk.Tk):
             style.configure('Production.Treeview.Heading', font=self._tree_heading_font, padding=(6, max(4, (int(self.display_settings.get('header_row_height', 42)) - 20) // 2)))
         except tk.TclError:
             pass
-
-        outer = ttk.Frame(win, padding=(18, 14, 18, 14))
-        outer.pack(fill='both', expand=True)
-
-        # Header
-        header = ttk.Frame(outer)
-        header.pack(fill='x', pady=(0, 14))
-        title_frame = ttk.Frame(header)
-        title_frame.pack(side='left', fill='x', expand=True)
+        outer = ttk.Frame(win, padding=(18, 14, 18, 14)); outer.pack(fill='both', expand=True)
+        header = ttk.Frame(outer); header.pack(fill='x', pady=(0, 14))
+        title_frame = ttk.Frame(header); title_frame.pack(side='left', fill='x', expand=True)
         ttk.Label(title_frame, text=product_name, style='ProductionTitle.TLabel').pack(anchor='w')
         subtitle_parts = [part for part in (formulation, content) if part]
-        latest_rows = self.db.production_records(record_id)
+        latest_rows = self.db.production_records(record_id, limit=1)
         latest_date = str(latest_rows[0]['production_date'] or '') if latest_rows else ''
-        if latest_date:
-            subtitle_parts.append(f'最近生產 {latest_date}')
+        if latest_date: subtitle_parts.append(f'最近生產 {latest_date}')
         ttk.Label(title_frame, text=' / '.join(subtitle_parts) if subtitle_parts else '尚無生產記錄', style='ProductionSub.TLabel').pack(anchor='w', pady=(3, 0))
         ttk.Button(header, text='新增生產記錄', command=lambda: edit_record(None)).pack(side='right', anchor='n')
-
-        # Summary cards
-        summary = ttk.Frame(outer)
-        summary.pack(fill='x', pady=(0, 18))
-        summary.columnconfigure(0, weight=1)
-        summary.columnconfigure(1, weight=1)
-
+        summary = ttk.Frame(outer); summary.pack(fill='x', pady=(0, 18)); summary.columnconfigure(0, weight=1); summary.columnconfigure(1, weight=1)
         def make_card(parent: tk.Misc, col: int, heading: str):
-            card = ttk.LabelFrame(parent, text=heading, style='ProductionCard.TLabelframe')
-            card.grid(row=0, column=col, sticky='nsew', padx=(0, 8) if col == 0 else (8, 0))
-            value_label = ttk.Label(card, text='0', style='ProductionCardValue.TLabel')
-            value_label.pack(anchor='w', pady=(0, 2))
-            detail_label = ttk.Label(card, text='', style='ProductionCardDetail.TLabel')
-            detail_label.pack(anchor='w')
+            card = ttk.LabelFrame(parent, text=heading, style='ProductionCard.TLabelframe'); card.grid(row=0, column=col, sticky='nsew', padx=(0,8) if col==0 else (8,0))
+            value_label=ttk.Label(card,text='0',style='ProductionCardValue.TLabel'); value_label.pack(anchor='w',pady=(0,2))
+            detail_label=ttk.Label(card,text='',style='ProductionCardDetail.TLabel'); detail_label.pack(anchor='w')
             return value_label, detail_label
-
-        total_value, total_detail = make_card(summary, 0, '記錄總數')
-        latest_value, latest_detail = make_card(summary, 1, '最新下單數量')
-
-        # History section
-        section = ttk.Frame(outer)
-        section.pack(fill='both', expand=True)
-        section_top = ttk.Frame(section)
-        section_top.pack(fill='x', pady=(0, 8))
-        section_title = ttk.Label(section_top, text='生產歷程', style='ProductionSection.TLabel')
-        section_title.pack(side='left')
-        ttk.Button(section_top, text='管理欄位', command=lambda: manage_columns()).pack(side='right')
-
-        table_wrap = ttk.Frame(section)
-        table_wrap.pack(fill='both', expand=True)
-        table = ttk.Treeview(table_wrap, show='headings', selectmode='browse', style='Production.Treeview')
-        yscroll = ttk.Scrollbar(table_wrap, orient='vertical', command=table.yview)
-        table.configure(yscrollcommand=yscroll.set)
-        table.grid(row=0, column=0, sticky='nsew')
-        yscroll.grid(row=0, column=1, sticky='ns')
-        table_wrap.rowconfigure(0, weight=1)
-        table_wrap.columnconfigure(0, weight=1)
-
-        all_data_columns = ('date', 'order', 'stock', 'manufacturer', 'remark')
-        headings = {
-            'date': ('生產日期', 145, 'center'),
-            'order': ('下單數量', 125, 'center'),
-            'stock': ('入庫數量', 125, 'center'),
-            'manufacturer': ('製作廠商', 210, 'w'),
-            'remark': ('備註', 1, 'w'),
-        }
-
-        self.production_display_settings = self.db.get_display_settings()
-
-        def configure_columns() -> None:
-            visible = list(self.production_display_settings.get('production_visible_columns', all_data_columns))
-            visible = [key for key in all_data_columns if key in visible]
-            table_columns = ('seq', *visible, 'actions')
-            table['columns'] = table_columns
-            table.heading('seq', text='序號', anchor='center')
-            table.column('seq', width=60, minwidth=55, anchor='center', stretch=False)
+        total_value,total_detail=make_card(summary,0,'記錄總數'); latest_value,latest_detail=make_card(summary,1,'最新下單數量')
+        section=ttk.Frame(outer); section.pack(fill='both',expand=True)
+        section_top=ttk.Frame(section); section_top.pack(fill='x',pady=(0,8))
+        section_title=ttk.Label(section_top,text='生產歷程',style='ProductionSection.TLabel'); section_title.pack(side='left')
+        ttk.Button(section_top,text='異常訂單',command=lambda: show_abnormal_orders()).pack(side='right',padx=(8,0))
+        ttk.Button(section_top,text='管理欄位',command=lambda: manage_columns()).pack(side='right')
+        table_wrap=ttk.Frame(section); table_wrap.pack(fill='both',expand=True)
+        table=ttk.Treeview(table_wrap,show='headings',selectmode='browse',style='Production.Treeview')
+        yscroll=ttk.Scrollbar(table_wrap,orient='vertical',command=table.yview); table.configure(yscrollcommand=yscroll.set)
+        table.grid(row=0,column=0,sticky='nsew'); yscroll.grid(row=0,column=1,sticky='ns'); table_wrap.rowconfigure(0,weight=1); table_wrap.columnconfigure(0,weight=1)
+        all_data_columns=('date','order','stock','manufacturer','remark')
+        headings={'date':('生產日期',145,'center'),'order':('下單數量',125,'center'),'stock':('入庫數量',125,'center'),'manufacturer':('製作廠商',210,'w'),'remark':('備註',1,'w')}
+        self.production_display_settings=self.db.get_display_settings(); page_size=100; page_var=tk.IntVar(value=0); page_info=tk.StringVar(value='')
+        def configure_columns():
+            visible=[key for key in all_data_columns if key in self.production_display_settings.get('production_visible_columns',all_data_columns)]
+            table['columns']=('seq',*visible,'actions'); table.heading('seq',text='序號',anchor='center'); table.column('seq',width=60,minwidth=55,anchor='center',stretch=False)
             for key in visible:
-                text, width, anchor = headings[key]
-                table.heading(key, text=text, anchor='center')
-                table.column(key, width=width, minwidth=90 if key != 'remark' else 160,
-                             anchor=anchor, stretch=(key == 'remark'))
-            table.heading('actions', text='操作', anchor='center')
-            table.column('actions', width=120, minwidth=110, anchor='center', stretch=False)
-
+                text,width,anchor=headings[key]; table.heading(key,text=text,anchor='center'); table.column(key,width=width,minwidth=90 if key!='remark' else 160,anchor=anchor,stretch=(key=='remark'))
+            table.heading('actions',text='操作',anchor='center'); table.column('actions',width=190,minwidth=175,anchor='center',stretch=False)
         configure_columns()
-
-        def selected_id() -> int | None:
-            sel = table.selection()
-            return int(sel[0]) if sel else None
-
-        def refresh() -> None:
-            rows = self.db.production_records(record_id)
-            total_value.config(text=f'{len(rows):,}')
-            total_detail.config(text='筆生產記錄')
-            if rows:
-                latest = rows[0]
-                latest_text = str(latest['order_quantity'] or latest['quantity'] or '').strip()
-                numeric_latest = latest_text.replace(',', '')
-                if numeric_latest.isdigit():
-                    latest_text = f'{int(numeric_latest):,}'
-                latest_value.config(text=latest_text or '0')
-                latest_detail.config(text=str(latest['production_date'] or ''))
-            else:
-                latest_value.config(text='0')
-                latest_detail.config(text='尚無資料')
-            section_title.config(text=f'生產歷程 {len(rows)} 筆記錄')
-            table.delete(*table.get_children())
-            visible = list(self.production_display_settings.get('production_visible_columns', all_data_columns))
-            for index, row in enumerate(rows, start=1):
-                data = {
-                    'date': str(row['production_date'] or ''),
-                    'order': str(row['order_quantity'] or row['quantity'] or ''),
-                    'stock': str(row['stock_quantity'] or ''),
-                    'manufacturer': str(row['manufacturer'] or ''),
-                    'remark': str(row['remark'] or ''),
-                }
-                row_values = [f'{index:02d}'] + [data[key] for key in all_data_columns if key in visible] + ['編輯  刪除']
-                table.insert('', 'end', iid=str(row['id']), values=row_values)
-            self.refresh_data()
-
-        def manage_manufacturers(parent: tk.Misc, manufacturer_combo: ttk.Combobox | None = None) -> None:
-            dialog = tk.Toplevel(parent)
-            dialog.title('管理製作廠商')
-            dialog.geometry('480x400')
-            dialog.minsize(420, 340)
-            dialog.transient(parent)
-
-            body = ttk.Frame(dialog, padding=16)
-            body.pack(fill='both', expand=True)
-            ttk.Label(body, text='製作廠商清單', style='ProductionSection.TLabel').pack(anchor='w', pady=(0, 8))
-            frame = ttk.Frame(body)
-            frame.pack(fill='both', expand=True)
-            tree = ttk.Treeview(frame, columns=('name',), show='headings', selectmode='browse', height=10)
-            tree.heading('name', text='製作廠商')
-            tree.column('name', width=360, anchor='w')
-            scroll = ttk.Scrollbar(frame, orient='vertical', command=tree.yview)
-            tree.configure(yscrollcommand=scroll.set)
-            tree.grid(row=0, column=0, sticky='nsew')
-            scroll.grid(row=0, column=1, sticky='ns')
-            frame.rowconfigure(0, weight=1)
-            frame.columnconfigure(0, weight=1)
-
-            def refresh_manufacturers() -> None:
-                tree.delete(*tree.get_children())
-                for row in self.db.production_manufacturers():
-                    tree.insert('', 'end', iid=str(row['id']), values=(row['name'],))
-                if manufacturer_combo is not None:
-                    manufacturer_combo['values'] = [row['name'] for row in self.db.production_manufacturers()]
-
-            def selected_manufacturer():
-                sel = tree.selection()
-                if not sel:
-                    return None
-                row_id = int(sel[0])
-                row = self.db.conn.execute('SELECT * FROM production_manufacturers WHERE id = ?', (row_id,)).fetchone()
-                return row
-
-            def name_dialog(existing=None) -> None:
-                editor = tk.Toplevel(dialog)
-                editor.title('新增製作廠商' if existing is None else '編輯製作廠商')
-                editor.resizable(False, False)
-                form = ttk.Frame(editor, padding=16)
-                form.pack(fill='both', expand=True)
-                ttk.Label(form, text='製作廠商名稱').grid(row=0, column=0, sticky='w', padx=(0, 10), pady=6)
-                var = tk.StringVar(value='' if existing is None else str(existing['name']))
-                entry = ttk.Entry(form, textvariable=var, width=34)
-                entry.grid(row=0, column=1, pady=6)
-                buttons = ttk.Frame(form)
-                buttons.grid(row=1, column=0, columnspan=2, sticky='e', pady=(12, 0))
-                ttk.Button(buttons, text='取消', command=editor.destroy).pack(side='right', padx=(8, 0))
-
-                def save_name() -> None:
-                    try:
-                        if existing is None:
-                            self.db.add_production_manufacturer(var.get())
-                        else:
-                            self.db.update_production_manufacturer(int(existing['id']), var.get())
-                        refresh_manufacturers()
-                        editor.destroy()
-                    except Exception as exc:
-                        messagebox.showerror('製作廠商', str(exc), parent=editor)
-
-                ttk.Button(buttons, text='儲存', command=save_name).pack(side='right')
-                editor.transient(dialog)
-                editor.grab_set()
-                editor.focus_set()
-                entry.focus_set()
-                editor.bind('<Return>', lambda _event: save_name())
-
-            def add_manufacturer() -> None:
-                name_dialog()
-
-            def edit_manufacturer() -> None:
-                row = selected_manufacturer()
-                if row is None:
-                    messagebox.showwarning('製作廠商', '請先選取一個製作廠商。', parent=dialog)
-                    return
-                name_dialog(row)
-
-            def delete_manufacturer() -> None:
-                row = selected_manufacturer()
-                if row is None:
-                    messagebox.showwarning('製作廠商', '請先選取一個製作廠商。', parent=dialog)
-                    return
-                if not messagebox.askyesno('刪除製作廠商', f'確定要刪除「{row["name"]}」嗎？', parent=dialog):
-                    return
+        def selected_id():
+            sel=table.selection(); return int(sel[0]) if sel else None
+        def mismatch(order,stock):
+            a=str(order or '').strip().replace(',',''); b=str(stock or '').strip().replace(',','')
+            return bool(a or b) and a!=b
+        def refresh():
+            page=max(0,int(page_var.get())); total=self.db.production_record_count(record_id); abnormal_total=self.db.production_record_count(record_id,abnormal_only=True); max_page=max(0,(total-1)//page_size)
+            if page>max_page: page=max_page; page_var.set(page)
+            rows=self.db.production_records(record_id,limit=page_size,offset=page*page_size); total_value.config(text=f'{total:,}'); total_detail.config(text=f'筆生產記錄，其中異常 {abnormal_total:,} 筆')
+            latest=self.db.production_records(record_id,limit=1)
+            if latest:
+                latest_text=str(latest[0]['order_quantity'] or latest[0]['quantity'] or '').strip(); latest_value.config(text=latest_text or '0'); latest_detail.config(text=str(latest[0]['production_date'] or ''))
+            else: latest_value.config(text='0'); latest_detail.config(text='尚無資料')
+            section_title.config(text=f'生產歷程 {total:,} 筆記錄'); table.delete(*table.get_children()); visible=[key for key in all_data_columns if key in self.production_display_settings.get('production_visible_columns',all_data_columns)]
+            for index,row in enumerate(rows,start=page*page_size+1):
+                order=str(row['order_quantity'] or row['quantity'] or ''); stock=str(row['stock_quantity'] or ''); data={'date':str(row['production_date'] or ''),'order':order,'stock':stock,'manufacturer':str(row['manufacturer'] or ''),'remark':str(row['remark'] or '')}; action='開啟連結 ／ 刪除' if str(row['external_url'] or '').strip() else '無連結 ／ 刪除'; tags=('abnormal',) if mismatch(order,stock) else ()
+                table.insert('', 'end', iid=str(row['id']), values=[f'{index:02d}']+[data[key] for key in visible]+[action], tags=tags)
+            table.tag_configure('abnormal',background='#FCE4E4'); page_count=max(1,max_page+1); page_info.set(f'第 {page+1} / {page_count} 頁  （每頁 {page_size} 筆）'); prev_btn.config(state='normal' if page>0 else 'disabled'); next_btn.config(state='normal' if page<max_page else 'disabled'); self.refresh_data()
+        def edit_record(existing_id=None):
+            old=self.db.production_record(existing_id) if existing_id is not None else None; dialog=tk.Toplevel(win); dialog.title('新增生產記錄' if old is None else '編輯生產記錄'); dialog.resizable(False,False)
+            form=ttk.Frame(dialog,padding=18); form.pack(fill='both',expand=True); form.columnconfigure(1,weight=1)
+            vars_={'date':tk.StringVar(value='' if old is None else old['production_date']),'order':tk.StringVar(value='' if old is None else (old['order_quantity'] or old['quantity'])),'stock':tk.StringVar(value='' if old is None else old['stock_quantity']),'manufacturer':tk.StringVar(value='' if old is None else old['manufacturer']),'remark':tk.StringVar(value='' if old is None else old['remark']),'url':tk.StringVar(value='' if old is None else old['external_url'])}
+            for i,(key,label) in enumerate([('date','生產日期'),('order','下單數量'),('stock','入庫數量')]): ttk.Label(form,text=label).grid(row=i,column=0,sticky='w',padx=(0,12),pady=6); ttk.Entry(form,textvariable=vars_[key],width=42).grid(row=i,column=1,sticky='ew',pady=6)
+            ttk.Label(form,text='製作廠商').grid(row=3,column=0,sticky='w',padx=(0,12),pady=6); combo=ttk.Combobox(form,textvariable=vars_['manufacturer'],width=39,state='normal',values=[r['name'] for r in self.db.production_manufacturers()]); combo.grid(row=3,column=1,sticky='ew',pady=6); ttk.Button(form,text='管理廠商',command=lambda:manage_manufacturers(dialog,combo)).grid(row=3,column=2,padx=(8,0),pady=6)
+            ttk.Label(form,text='備註').grid(row=4,column=0,sticky='w',padx=(0,12),pady=6); ttk.Entry(form,textvariable=vars_['remark'],width=42).grid(row=4,column=1,sticky='ew',pady=6)
+            ttk.Label(form,text='外部連結').grid(row=5,column=0,sticky='w',padx=(0,12),pady=6); ttk.Entry(form,textvariable=vars_['url'],width=42).grid(row=5,column=1,sticky='ew',pady=6); ttk.Label(form,text='例如：https://...',style='Hint.TLabel').grid(row=6,column=1,sticky='w')
+            buttons=ttk.Frame(form); buttons.grid(row=7,column=0,columnspan=3,sticky='e',pady=(14,0))
+            def save():
                 try:
-                    self.db.delete_production_manufacturer(int(row['id']))
-                    refresh_manufacturers()
-                except Exception as exc:
-                    messagebox.showerror('製作廠商', str(exc), parent=dialog)
-
-            buttons = ttk.Frame(body)
-            buttons.pack(fill='x', pady=(10, 0))
-            ttk.Button(buttons, text='新增', command=add_manufacturer).pack(side='left')
-            ttk.Button(buttons, text='編輯', command=edit_manufacturer).pack(side='left', padx=6)
-            ttk.Button(buttons, text='刪除', command=delete_manufacturer).pack(side='left')
-            ttk.Button(buttons, text='關閉', command=dialog.destroy).pack(side='right')
-            refresh_manufacturers()
-            dialog.grab_set()
-
-        def edit_record(existing_id: int | None = None) -> None:
-            old = None
-            if existing_id is not None:
-                old = next((r for r in self.db.production_records(record_id) if int(r['id']) == existing_id), None)
-            dialog = tk.Toplevel(win)
-            dialog.title('新增生產記錄' if old is None else '編輯生產記錄')
-            dialog.resizable(False, False)
-            form = ttk.Frame(dialog, padding=18)
-            form.pack(fill='both', expand=True)
-            form.columnconfigure(1, weight=1)
-
-            vars_ = {
-                'date': tk.StringVar(value='' if old is None else old['production_date']),
-                'order': tk.StringVar(value='' if old is None else (old['order_quantity'] or old['quantity'])),
-                'stock': tk.StringVar(value='' if old is None else old['stock_quantity']),
-                'manufacturer': tk.StringVar(value='' if old is None else old['manufacturer']),
-                'remark': tk.StringVar(value='' if old is None else old['remark']),
-            }
-            ttk.Label(form, text='生產日期').grid(row=0, column=0, sticky='w', padx=(0, 12), pady=6)
-            ttk.Entry(form, textvariable=vars_['date'], width=42).grid(row=0, column=1, sticky='ew', pady=6)
-            ttk.Label(form, text='下單數量').grid(row=1, column=0, sticky='w', padx=(0, 12), pady=6)
-            ttk.Entry(form, textvariable=vars_['order'], width=42).grid(row=1, column=1, sticky='ew', pady=6)
-            ttk.Label(form, text='入庫數量').grid(row=2, column=0, sticky='w', padx=(0, 12), pady=6)
-            ttk.Entry(form, textvariable=vars_['stock'], width=42).grid(row=2, column=1, sticky='ew', pady=6)
-            ttk.Label(form, text='製作廠商').grid(row=3, column=0, sticky='w', padx=(0, 12), pady=6)
-            manufacturer_combo = ttk.Combobox(
-                form, textvariable=vars_['manufacturer'], width=39, state='normal',
-                values=[row['name'] for row in self.db.production_manufacturers()]
-            )
-            manufacturer_combo.grid(row=3, column=1, sticky='ew', pady=6)
-            ttk.Button(form, text='管理廠商', command=lambda: manage_manufacturers(dialog, manufacturer_combo)).grid(row=3, column=2, padx=(8, 0), pady=6)
-            ttk.Label(form, text='備註').grid(row=4, column=0, sticky='w', padx=(0, 12), pady=6)
-            ttk.Entry(form, textvariable=vars_['remark'], width=42).grid(row=4, column=1, sticky='ew', pady=6)
-
-            buttons = ttk.Frame(form)
-            buttons.grid(row=5, column=0, columnspan=3, sticky='e', pady=(14, 0))
-
-            def save() -> None:
-                try:
-                    if not vars_['date'].get().strip():
-                        messagebox.showwarning('生產記錄', '請輸入生產日期。', parent=dialog)
-                        return
-                    manufacturer = vars_['manufacturer'].get().strip()
-                    self.db.ensure_production_manufacturer(manufacturer)
-                    if old is None:
-                        self.db.create_production_record(record_id, vars_['date'].get(), vars_['order'].get(), vars_['stock'].get(), manufacturer, vars_['remark'].get())
-                    else:
-                        self.db.update_production_record(existing_id, vars_['date'].get(), vars_['order'].get(), vars_['stock'].get(), manufacturer, vars_['remark'].get())
-                    dialog.destroy()
-                    refresh()
-                except Exception as exc:
-                    messagebox.showerror('生產記錄', str(exc), parent=dialog)
-
-            ttk.Button(buttons, text='取消', command=dialog.destroy).pack(side='right', padx=(8, 0))
-            ttk.Button(buttons, text='儲存', command=save).pack(side='right')
-            dialog.transient(win)
-            dialog.grab_set()
-            dialog.focus_set()
-            manufacturer_combo.focus_set()
-
-        def edit_selected() -> None:
-            pid = selected_id()
-            if pid is None:
-                messagebox.showwarning('生產記錄', '請先選取一筆生產記錄。', parent=win)
-                return
+                    if not vars_['date'].get().strip(): messagebox.showwarning('生產記錄','請輸入生產日期。',parent=dialog); return
+                    manufacturer=vars_['manufacturer'].get().strip(); self.db.ensure_production_manufacturer(manufacturer)
+                    if old is None: self.db.create_production_record(record_id,vars_['date'].get(),vars_['order'].get(),vars_['stock'].get(),manufacturer,vars_['remark'].get(),external_url=vars_['url'].get())
+                    else: self.db.update_production_record(existing_id,vars_['date'].get(),vars_['order'].get(),vars_['stock'].get(),manufacturer,vars_['remark'].get(),external_url=vars_['url'].get())
+                    dialog.destroy(); refresh()
+                except Exception as exc: messagebox.showerror('生產記錄',str(exc),parent=dialog)
+            ttk.Button(buttons,text='取消',command=dialog.destroy).pack(side='right',padx=(8,0)); ttk.Button(buttons,text='儲存',command=save).pack(side='right'); dialog.transient(win); dialog.grab_set(); dialog.focus_set(); combo.focus_set()
+        def edit_selected():
+            pid=selected_id()
+            if pid is None: messagebox.showwarning('生產記錄','請先選取一筆生產記錄。',parent=win); return
             edit_record(pid)
-
-        def manage_columns() -> None:
-            dialog = tk.Toplevel(win)
-            dialog.title('管理生產履歷欄位')
-            dialog.resizable(False, False)
-            body = ttk.Frame(dialog, padding=18)
-            body.pack(fill='both', expand=True)
-            ttk.Label(body, text='選擇要顯示的欄位', style='ProductionSection.TLabel').pack(anchor='w', pady=(0, 10))
-            labels = {'date': '生產日期', 'order': '下單數量', 'stock': '入庫數量', 'manufacturer': '製作廠商', 'remark': '備註'}
-            current = set(self.production_display_settings.get('production_visible_columns', all_data_columns))
-            vars_ = {}
-            for key in all_data_columns:
-                var = tk.BooleanVar(value=key in current)
-                vars_[key] = var
-                ttk.Checkbutton(body, text=labels[key], variable=var).pack(fill='x', pady=3)
-            buttons = ttk.Frame(body)
-            buttons.pack(fill='x', pady=(14, 0))
-
-            def save_columns() -> None:
-                selected = [key for key in all_data_columns if vars_[key].get()]
-                if not selected:
-                    messagebox.showwarning('管理欄位', '至少要保留一個欄位。', parent=dialog)
-                    return
-                self.production_display_settings['production_visible_columns'] = selected
-                self.db.save_display_settings(self.production_display_settings)
-                configure_columns()
-                dialog.destroy()
-                refresh()
-
-            ttk.Button(buttons, text='取消', command=dialog.destroy).pack(side='right', padx=(8, 0))
-            ttk.Button(buttons, text='儲存', command=save_columns).pack(side='right')
-            dialog.transient(win)
-            dialog.grab_set()
-
-        def table_click(event: Any) -> None:
-            region = table.identify('region', event.x, event.y)
-            if region != 'cell':
-                return
-            row_id = table.identify_row(event.y)
-            col = table.identify_column(event.x)
-            if not row_id:
-                return
-            current_columns = list(table['columns'])
-            if col == f"#{current_columns.index('actions') + 1}":
-                bbox = table.bbox(row_id, 'actions')
-                if bbox:
-                    local_x = event.x - bbox[0]
-                    if local_x < bbox[2] / 2:
-                        edit_record(int(row_id))
-                    else:
-                        if messagebox.askyesno('刪除生產記錄', '確定要刪除選取的生產記錄嗎？', parent=win):
-                            self.db.delete_production_record(int(row_id))
-                            refresh()
-
-        footer = ttk.Frame(outer)
-        footer.pack(fill='x', pady=(10, 0))
-        ttk.Label(footer, text='雙擊生產記錄可編輯；製作廠商可直接輸入，也可以按「管理廠商」維護下拉選單。', style='Hint.TLabel').pack(side='left')
-        ttk.Button(footer, text='關閉', command=win.destroy).pack(side='right')
-
-        table.bind('<Button-1>', table_click, add='+')
-        table.bind('<Double-1>', lambda _event: edit_selected())
-        refresh()
+        def manage_columns():
+            dialog=tk.Toplevel(win); dialog.title('管理生產履歷欄位'); dialog.resizable(False,False); body=ttk.Frame(dialog,padding=18); body.pack(fill='both',expand=True); ttk.Label(body,text='選擇要顯示的欄位',style='ProductionSection.TLabel').pack(anchor='w',pady=(0,10)); labels={'date':'生產日期','order':'下單數量','stock':'入庫數量','manufacturer':'製作廠商','remark':'備註'}; current=set(self.production_display_settings.get('production_visible_columns',all_data_columns)); vars_={}
+            for key in all_data_columns: vars_[key]=tk.BooleanVar(value=key in current); ttk.Checkbutton(body,text=labels[key],variable=vars_[key]).pack(fill='x',pady=3)
+            buttons=ttk.Frame(body); buttons.pack(fill='x',pady=(14,0))
+            def save_columns():
+                selected=[key for key in all_data_columns if vars_[key].get()]
+                if not selected: messagebox.showwarning('管理欄位','至少要保留一個欄位。',parent=dialog); return
+                self.production_display_settings['production_visible_columns']=selected; self.db.save_display_settings(self.production_display_settings); configure_columns(); dialog.destroy(); refresh()
+            ttk.Button(buttons,text='取消',command=dialog.destroy).pack(side='right',padx=(8,0)); ttk.Button(buttons,text='儲存',command=save_columns).pack(side='right'); dialog.transient(win); dialog.grab_set()
+        def show_abnormal_orders():
+            dialog=tk.Toplevel(win); dialog.title(f'異常訂單 - {product_name}'); dialog.geometry('1080x600'); dialog.minsize(900,500); dialog.transient(win); body=ttk.Frame(dialog,padding=16); body.pack(fill='both',expand=True); top=ttk.Frame(body); top.pack(fill='x',pady=(0,10)); count=self.db.production_record_count(record_id,abnormal_only=True); ttk.Label(top,text=f'下單數量與入庫數量不符合，共 {count:,} 筆',style='ProductionSection.TLabel').pack(side='left')
+            frame=ttk.Frame(body); frame.pack(fill='both',expand=True); cols=('seq','date','order','stock','manufacturer','remark','actions'); tree2=ttk.Treeview(frame,columns=cols,show='headings',selectmode='browse',style='Production.Treeview')
+            for key,text,width,anchor in [('seq','序號',60,'center'),('date','生產日期',145,'center'),('order','下單數量',125,'center'),('stock','入庫數量',125,'center'),('manufacturer','製作廠商',190,'w'),('remark','備註',1,'w'),('actions','操作',190,'center')]: tree2.heading(key,text=text,anchor='center'); tree2.column(key,width=width,minwidth=90 if key!='remark' else 160,anchor=anchor,stretch=(key=='remark'))
+            scroll=ttk.Scrollbar(frame,orient='vertical',command=tree2.yview); tree2.configure(yscrollcommand=scroll.set); tree2.grid(row=0,column=0,sticky='nsew'); scroll.grid(row=0,column=1,sticky='ns'); frame.rowconfigure(0,weight=1); frame.columnconfigure(0,weight=1)
+            rows=self.db.production_records(record_id,abnormal_only=True)
+            for index,row in enumerate(rows,1): tree2.insert('', 'end',iid=str(row['id']),values=(f'{index:02d}',str(row['production_date'] or ''),str(row['order_quantity'] or row['quantity'] or ''),str(row['stock_quantity'] or ''),str(row['manufacturer'] or ''),str(row['remark'] or ''),'開啟連結 ／ 刪除' if str(row['external_url'] or '').strip() else '無連結 ／ 刪除'),tags=('abnormal',))
+            tree2.tag_configure('abnormal',background='#FCE4E4')
+            def click_abnormal(event):
+                row_id=tree2.identify_row(event.y); col=tree2.identify_column(event.x)
+                if not row_id or col!='#7': return
+                bbox=tree2.bbox(row_id,'actions')
+                if not bbox: return
+                row=self.db.production_record(int(row_id))
+                if event.x-bbox[0] < bbox[2]*0.65:
+                    if row and str(row['external_url'] or '').strip(): self.open_link(str(row['external_url']))
+                    else: messagebox.showinfo('外部連結','這筆生產記錄沒有設定外部連結。',parent=dialog)
+                elif messagebox.askyesno('刪除生產記錄','確定要刪除選取的生產記錄嗎？',parent=dialog): self.db.delete_production_record(int(row_id)); dialog.destroy(); refresh()
+            tree2.bind('<Button-1>',click_abnormal,add='+'); ttk.Button(body,text='關閉',command=dialog.destroy).pack(side='right',pady=(10,0)); dialog.grab_set()
+        def table_click(event):
+            if table.identify('region',event.x,event.y)!='cell': return
+            row_id=table.identify_row(event.y); col=table.identify_column(event.x)
+            if not row_id: return
+            current_columns=list(table['columns'])
+            if col==f"#{current_columns.index('actions')+1}":
+                bbox=table.bbox(row_id,'actions')
+                if not bbox: return
+                row=self.db.production_record(int(row_id)); local_x=event.x-bbox[0]
+                if local_x < bbox[2]*0.65:
+                    if row and str(row['external_url'] or '').strip(): self.open_link(str(row['external_url']))
+                    else: messagebox.showinfo('外部連結','這筆生產記錄沒有設定外部連結。',parent=win)
+                elif messagebox.askyesno('刪除生產記錄','確定要刪除選取的生產記錄嗎？',parent=win): self.db.delete_production_record(int(row_id)); refresh()
+        pager=ttk.Frame(outer); pager.pack(fill='x',pady=(10,0)); prev_btn=ttk.Button(pager,text='上一頁',command=lambda:(page_var.set(max(0,page_var.get()-1)),refresh())); prev_btn.pack(side='left'); ttk.Label(pager,textvariable=page_info,style='Hint.TLabel').pack(side='left',padx=12); next_btn=ttk.Button(pager,text='下一頁',command=lambda:(page_var.set(page_var.get()+1),refresh())); next_btn.pack(side='left')
+        footer=ttk.Frame(outer); footer.pack(fill='x',pady=(8,0)); ttk.Label(footer,text='點擊「開啟連結」開啟外部網址；「刪除」可刪除記錄；雙擊其他欄位可編輯。異常訂單會以淺紅色標示。',style='Hint.TLabel').pack(side='left'); ttk.Button(footer,text='關閉',command=win.destroy).pack(side='right')
+        table.bind('<Button-1>',table_click,add='+'); table.bind('<Double-1>',lambda _event:edit_selected()); refresh()
 
     def edit_link(self, parent: tk.Misc, link_var: tk.StringVar) -> None:
         dialog = LinkDialog(parent, link_var.get())
