@@ -115,6 +115,11 @@ class Database:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS companies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                position INTEGER NOT NULL DEFAULT 0
+            );
             CREATE TABLE IF NOT EXISTS fields (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
@@ -129,7 +134,9 @@ class Database:
             CREATE TABLE IF NOT EXISTS records (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                company_id INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY (company_id) REFERENCES companies(id)
             );
             CREATE TABLE IF NOT EXISTS record_values (
                 record_id INTEGER NOT NULL,
@@ -167,8 +174,11 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_production_records_manufacturer ON production_records(manufacturer);
             CREATE TABLE IF NOT EXISTS production_manufacturers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
-                position INTEGER NOT NULL DEFAULT 0
+                name TEXT NOT NULL,
+                company_id INTEGER NOT NULL DEFAULT 1,
+                position INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (company_id) REFERENCES companies(id),
+                UNIQUE(company_id, name)
             );
             CREATE TABLE IF NOT EXISTS lookup_pairs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -178,6 +188,61 @@ class Database:
             );
             '''
         )
+        # 公司資料層：舊版資料全部歸入第一家公司，並建立第二家公司。
+        company_rows = list(self.conn.execute('SELECT id, name FROM companies ORDER BY position, id'))
+        if not company_rows:
+            self.conn.execute("INSERT INTO companies(name, position) VALUES ('公司 A', 0)")
+            self.conn.execute("INSERT INTO companies(name, position) VALUES ('公司 B', 1)")
+        else:
+            names = {str(r['name']) for r in company_rows}
+            if '公司 A' not in names:
+                self.conn.execute("INSERT INTO companies(name, position) VALUES ('公司 A', COALESCE((SELECT MAX(position)+1 FROM companies), 0))")
+            if '公司 B' not in names:
+                self.conn.execute("INSERT INTO companies(name, position) VALUES ('公司 B', COALESCE((SELECT MAX(position)+1 FROM companies), 0))")
+        company_ids = [int(r['id']) for r in self.conn.execute('SELECT id FROM companies ORDER BY position, id')]
+        default_company_id = company_ids[0]
+
+        record_columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(records)')}
+        if 'company_id' not in record_columns:
+            self.conn.execute('ALTER TABLE records ADD COLUMN company_id INTEGER NOT NULL DEFAULT 1')
+        self.conn.execute('UPDATE records SET company_id = ? WHERE company_id IS NULL OR company_id <= 0', (default_company_id,))
+        self.conn.execute('CREATE INDEX IF NOT EXISTS idx_records_company_id ON records(company_id)')
+
+        manufacturer_columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(production_manufacturers)')}
+        if 'company_id' not in manufacturer_columns:
+            # 舊版 manufacturer 表的 name 全域唯一，直接加入公司欄位即可；同名廠商仍可在兩家公司各自使用。
+            self.conn.execute('ALTER TABLE production_manufacturers ADD COLUMN company_id INTEGER NOT NULL DEFAULT 1')
+        self.conn.execute('UPDATE production_manufacturers SET company_id = ? WHERE company_id IS NULL OR company_id <= 0', (default_company_id,))
+        # V5 的廠商表是 name 全域唯一。V6+ 需要改成「每家公司各自唯一」，因此第一次升級時重建此表。
+        unique_name_index = False
+        for idx in self.conn.execute('PRAGMA index_list(production_manufacturers)').fetchall():
+            if int(idx['unique']) != 1:
+                continue
+            idx_name = str(idx['name'])
+            cols = [str(r['name']) for r in self.conn.execute(f'PRAGMA index_info("{idx_name.replace(chr(34), chr(34)*2)}")').fetchall()]
+            if cols == ['name']:
+                unique_name_index = True
+                break
+        if unique_name_index:
+            self.conn.execute('ALTER TABLE production_manufacturers RENAME TO production_manufacturers_old')
+            self.conn.execute('''
+                CREATE TABLE production_manufacturers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    company_id INTEGER NOT NULL DEFAULT 1,
+                    position INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY (company_id) REFERENCES companies(id),
+                    UNIQUE(company_id, name)
+                )
+            ''')
+            self.conn.execute('''
+                INSERT INTO production_manufacturers(id, name, company_id, position)
+                SELECT id, name, company_id, position FROM production_manufacturers_old
+            ''')
+            self.conn.execute('DROP TABLE production_manufacturers_old')
+        self.conn.execute('CREATE INDEX IF NOT EXISTS idx_production_manufacturers_company ON production_manufacturers(company_id, position, id)')
+        self.conn.execute('CREATE INDEX IF NOT EXISTS idx_records_company_id_id ON records(company_id, id)')
+
         production_columns = {row['name'] for row in self.conn.execute('PRAGMA table_info(production_records)')}
         if 'order_quantity' not in production_columns:
             self.conn.execute("ALTER TABLE production_records ADD COLUMN order_quantity TEXT NOT NULL DEFAULT ''")
@@ -228,7 +293,8 @@ class Database:
     def has_data(self) -> bool:
         return self.conn.execute('SELECT COUNT(*) FROM fields').fetchone()[0] > 0
 
-    def import_excel(self, xlsx_path: Path, replace: bool = False) -> tuple[int, int]:
+    def import_excel(self, xlsx_path: Path, replace: bool = False, company_id: int | None = None) -> tuple[int, int]:
+        company_id = int(company_id or self.default_company_id())
         wb_values = load_workbook(xlsx_path, data_only=True, read_only=False)
         wb_formulas = load_workbook(xlsx_path, data_only=False, read_only=False)
         ws = wb_values[wb_values.sheetnames[0]]
@@ -255,10 +321,10 @@ class Database:
                 data_rows.append(row)
 
         if replace:
-            self.conn.execute('DELETE FROM production_records')
-            self.conn.execute('DELETE FROM record_links')
-            self.conn.execute('DELETE FROM record_values')
-            self.conn.execute('DELETE FROM records')
+            self.conn.execute('DELETE FROM production_records WHERE record_id IN (SELECT id FROM records WHERE company_id = ?)', (company_id,))
+            self.conn.execute('DELETE FROM record_links WHERE record_id IN (SELECT id FROM records WHERE company_id = ?)', (company_id,))
+            self.conn.execute('DELETE FROM record_values WHERE record_id IN (SELECT id FROM records WHERE company_id = ?)', (company_id,))
+            self.conn.execute('DELETE FROM records WHERE company_id = ?', (company_id,))
 
         current_fields = self.list_fields()
         existing_names = {row['name']: row for row in current_fields}
@@ -283,7 +349,7 @@ class Database:
 
         lookup_by_term = {term: code for code, term in DEFAULT_LOOKUPS}
         for row in data_rows:
-            record_id = self.create_record({})
+            record_id = self.create_record({}, company_id=company_id)
             for col, field_id in enumerate(field_ids, start=1):
                 value = ws.cell(row, col).value
                 formula_cell = ws_formula.cell(row, col).value
@@ -439,10 +505,32 @@ class Database:
         )
         self.conn.commit()
 
-    def create_record(self, values: dict[int, Any]) -> int:
+    def companies(self) -> list[sqlite3.Row]:
+        return list(self.conn.execute('SELECT id, name, position FROM companies ORDER BY position, id'))
+
+    def default_company_id(self) -> int:
+        row = self.conn.execute('SELECT id FROM companies ORDER BY position, id LIMIT 1').fetchone()
+        if not row:
+            self.conn.execute("INSERT INTO companies(name, position) VALUES ('公司 A', 0)")
+            self.conn.execute("INSERT INTO companies(name, position) VALUES ('公司 B', 1)")
+            self.conn.commit()
+            row = self.conn.execute('SELECT id FROM companies ORDER BY position, id LIMIT 1').fetchone()
+        return int(row['id'])
+
+    def rename_company(self, company_id: int, name: str) -> None:
+        name = name.strip()
+        if not name:
+            raise ValueError('公司名稱不可空白。')
+        if self.conn.execute('SELECT 1 FROM companies WHERE name = ? AND id <> ?', (name, int(company_id))).fetchone():
+            raise ValueError('公司名稱已存在。')
+        self.conn.execute('UPDATE companies SET name = ? WHERE id = ?', (name, int(company_id)))
+        self.conn.commit()
+
+    def create_record(self, values: dict[int, Any], company_id: int | None = None) -> int:
+        company_id = int(company_id or self.default_company_id())
         now = datetime.now().isoformat(timespec='seconds')
         cursor = self.conn.execute(
-            'INSERT INTO records(created_at, updated_at) VALUES (?, ?)', (now, now)
+            'INSERT INTO records(created_at, updated_at, company_id) VALUES (?, ?, ?)', (now, now, company_id)
         )
         record_id = int(cursor.lastrowid)
         for field_id, value in values.items():
@@ -501,8 +589,9 @@ class Database:
             )
         self.conn.commit()
 
-    def all_records(self) -> list[dict[str, Any]]:
-        records = self.conn.execute('SELECT id, created_at, updated_at FROM records ORDER BY id')
+    def all_records(self, company_id: int | None = None) -> list[dict[str, Any]]:
+        company_id = int(company_id or self.default_company_id())
+        records = self.conn.execute('SELECT id, created_at, updated_at FROM records WHERE company_id = ? ORDER BY id', (company_id,))
         result = []
         for record in records:
             result.append({
@@ -565,27 +654,30 @@ class Database:
         self.conn.execute('DELETE FROM production_records WHERE id = ?', (int(production_id),))
         self.conn.commit()
 
-    def production_manufacturers(self) -> list[sqlite3.Row]:
-        return list(self.conn.execute('SELECT * FROM production_manufacturers ORDER BY position, id'))
+    def production_manufacturers(self, company_id: int | None = None) -> list[sqlite3.Row]:
+        company_id = int(company_id or self.default_company_id())
+        return list(self.conn.execute('SELECT * FROM production_manufacturers WHERE company_id = ? ORDER BY position, id', (company_id,)))
 
-    def ensure_production_manufacturer(self, name: str) -> None:
+    def ensure_production_manufacturer(self, name: str, company_id: int | None = None) -> None:
         name = name.strip()
+        company_id = int(company_id or self.default_company_id())
         if not name:
             return
-        exists = self.conn.execute('SELECT 1 FROM production_manufacturers WHERE name = ?', (name,)).fetchone()
+        exists = self.conn.execute('SELECT 1 FROM production_manufacturers WHERE name = ? AND company_id = ?', (name, company_id)).fetchone()
         if not exists:
-            position = int(self.conn.execute('SELECT COALESCE(MAX(position), -1) + 1 FROM production_manufacturers').fetchone()[0])
-            self.conn.execute('INSERT INTO production_manufacturers(name, position) VALUES (?, ?)', (name, position))
+            position = int(self.conn.execute('SELECT COALESCE(MAX(position), -1) + 1 FROM production_manufacturers WHERE company_id = ?', (company_id,)).fetchone()[0])
+            self.conn.execute('INSERT INTO production_manufacturers(name, company_id, position) VALUES (?, ?, ?)', (name, company_id, position))
             self.conn.commit()
 
-    def add_production_manufacturer(self, name: str) -> None:
+    def add_production_manufacturer(self, name: str, company_id: int | None = None) -> None:
         name = name.strip()
+        company_id = int(company_id or self.default_company_id())
         if not name:
             raise ValueError('製作廠商名稱不可空白。')
-        if self.conn.execute('SELECT 1 FROM production_manufacturers WHERE name = ?', (name,)).fetchone():
+        if self.conn.execute('SELECT 1 FROM production_manufacturers WHERE name = ? AND company_id = ?', (name, company_id)).fetchone():
             raise ValueError('這個製作廠商已經存在。')
-        position = int(self.conn.execute('SELECT COALESCE(MAX(position), -1) + 1 FROM production_manufacturers').fetchone()[0])
-        self.conn.execute('INSERT INTO production_manufacturers(name, position) VALUES (?, ?)', (name, position))
+        position = int(self.conn.execute('SELECT COALESCE(MAX(position), -1) + 1 FROM production_manufacturers WHERE company_id = ?', (company_id,)).fetchone()[0])
+        self.conn.execute('INSERT INTO production_manufacturers(name, company_id, position) VALUES (?, ?, ?)', (name, company_id, position))
         self.conn.commit()
 
     def update_production_manufacturer(self, manufacturer_id: int, name: str) -> None:
@@ -593,15 +685,21 @@ class Database:
         if not name:
             raise ValueError('製作廠商名稱不可空白。')
         duplicate = self.conn.execute(
-            'SELECT 1 FROM production_manufacturers WHERE name = ? AND id <> ?', (name, int(manufacturer_id))
+            'SELECT 1 FROM production_manufacturers WHERE name = ? AND id <> ? AND company_id = (SELECT company_id FROM production_manufacturers WHERE id = ?)', (name, int(manufacturer_id), int(manufacturer_id))
         ).fetchone()
         if duplicate:
             raise ValueError('這個製作廠商已經存在。')
-        old_row = self.conn.execute('SELECT name FROM production_manufacturers WHERE id = ?', (int(manufacturer_id),)).fetchone()
+        old_row = self.conn.execute('SELECT name, company_id FROM production_manufacturers WHERE id = ?', (int(manufacturer_id),)).fetchone()
         old_name = str(old_row['name']) if old_row else ''
+        company_id = int(old_row['company_id']) if old_row else self.default_company_id()
         self.conn.execute('UPDATE production_manufacturers SET name = ? WHERE id = ?', (name, int(manufacturer_id)))
         if old_name and old_name != name:
-            self.conn.execute('UPDATE production_records SET manufacturer = ? WHERE manufacturer = ?', (name, old_name))
+            self.conn.execute(
+                '''UPDATE production_records SET manufacturer = ?
+                   WHERE manufacturer = ?
+                     AND record_id IN (SELECT id FROM records WHERE company_id = ?)''',
+                (name, old_name, company_id),
+            )
         self.conn.commit()
 
     def delete_production_manufacturer(self, manufacturer_id: int) -> None:
@@ -609,8 +707,12 @@ class Database:
         if not row:
             return
         name = str(row['name'])
+        company_id = int(row['company_id'])
         used = self.conn.execute(
-            'SELECT COUNT(*) FROM production_records WHERE manufacturer = ?', (name,)
+            '''SELECT COUNT(*) FROM production_records
+               WHERE manufacturer = ?
+                 AND record_id IN (SELECT id FROM records WHERE company_id = ?)''',
+            (name, company_id),
         ).fetchone()[0]
         if int(used) > 0:
             raise ValueError(f'「{name}」目前有 {int(used)} 筆生產記錄正在使用，請先修改那些記錄後再刪除。')
@@ -955,6 +1057,8 @@ class OfflineDatabaseApp(tk.Tk):
         self.geometry('1440x820')
         self.minsize(1050, 650)
         self.protocol('WM_DELETE_WINDOW', self._on_close)
+        self.current_company_id = self.db.default_company_id()
+        self.company_notebook: ttk.Notebook | None = None
         self.search_var = tk.StringVar()
         self.status_var = tk.StringVar(value='就緒')
         self.tree: ttk.Treeview
@@ -1010,7 +1114,26 @@ class OfflineDatabaseApp(tk.Tk):
         self._build_backup_tab()
 
     def _build_data_tab(self) -> None:
-        toolbar = ttk.Frame(self.data_tab, padding=(10, 10, 10, 6))
+        company_bar = ttk.Frame(self.data_tab, padding=(10, 10, 10, 4))
+        company_bar.pack(fill='x')
+        ttk.Label(company_bar, text='公司').pack(side='left', padx=(0, 8))
+        self.company_notebook = ttk.Notebook(company_bar, height=34)
+        self.company_notebook.pack(side='left', fill='x', expand=False)
+        for company in self.db.companies():
+            frame = ttk.Frame(self.company_notebook)
+            self.company_notebook.add(frame, text=str(company['name']))
+        self.company_notebook.bind('<<NotebookTabChanged>>', self._on_company_tab_changed)
+        companies = self.db.companies()
+        for idx, company in enumerate(companies):
+            if int(company['id']) == self.current_company_id:
+                self.company_notebook.select(idx)
+                break
+        ttk.Button(company_bar, text='編輯公司名稱', command=self.edit_company_names).pack(side='left', padx=10)
+        ttk.Label(company_bar, text='目前公司：', style='Hint.TLabel').pack(side='left', padx=(8, 0))
+        self.company_label_var = tk.StringVar()
+        ttk.Label(company_bar, textvariable=self.company_label_var, font=('Microsoft JhengHei UI', 10, 'bold')).pack(side='left', padx=(4, 0))
+
+        toolbar = ttk.Frame(self.data_tab, padding=(10, 6, 10, 6))
         toolbar.pack(fill='x')
         ttk.Label(toolbar, text='搜尋').pack(side='left')
         search = ttk.Entry(toolbar, textvariable=self.search_var, width=34)
@@ -1040,6 +1163,71 @@ class OfflineDatabaseApp(tk.Tk):
         self.tree.bind('<ButtonRelease-1>', self._on_tree_button_release, add='+')
         self.tree.bind('<ButtonRelease-1>', self._on_tree_link_click, add='+')
         self.tree.bind('<ButtonRelease-1>', self._on_tree_production_click, add='+')
+        self._on_company_tab_changed()
+
+    def _on_company_tab_changed(self, _event: Any = None) -> None:
+        if not self.company_notebook:
+            return
+        tabs = self.company_notebook.tabs()
+        selected = self.company_notebook.select()
+        if selected in tabs:
+            index = tabs.index(selected)
+            companies = self.db.companies()
+            if index < len(companies):
+                self.current_company_id = int(companies[index]['id'])
+                if hasattr(self, 'company_label_var'):
+                    self.company_label_var.set(str(companies[index]['name']))
+                self._sort_field_id = None
+                self._sort_reverse = False
+                self.refresh_data()
+                self.status_var.set(f'目前公司：{companies[index]["name"]}')
+
+    def edit_company_names(self) -> None:
+        companies = self.db.companies()
+        dialog = tk.Toplevel(self)
+        dialog.title('編輯公司名稱')
+        dialog.resizable(False, False)
+        body = ttk.Frame(dialog, padding=18)
+        body.pack(fill='both', expand=True)
+        vars_: list[tuple[int, tk.StringVar]] = []
+        for row, company in enumerate(companies):
+            ttk.Label(body, text=f'公司 {row + 1}').grid(row=row, column=0, sticky='w', padx=(0, 12), pady=6)
+            var = tk.StringVar(value=str(company['name']))
+            ttk.Entry(body, textvariable=var, width=34).grid(row=row, column=1, sticky='ew', pady=6)
+            vars_.append((int(company['id']), var))
+        def save():
+            try:
+                names = [v.get().strip() for _, v in vars_]
+                if any(not n for n in names) or len(names) != len(set(names)):
+                    raise ValueError('公司名稱不可空白，且不可重複。')
+                for company_id, var in vars_:
+                    self.db.rename_company(company_id, var.get())
+                dialog.destroy()
+                self._rebuild_company_tabs()
+            except ValueError as exc:
+                messagebox.showerror('公司設定', str(exc), parent=dialog)
+        ttk.Button(body, text='儲存', command=save).grid(row=len(vars_), column=0, pady=(14, 0))
+        ttk.Button(body, text='取消', command=dialog.destroy).grid(row=len(vars_), column=1, sticky='e', pady=(14, 0))
+        dialog.transient(self)
+        dialog.grab_set()
+
+    def _rebuild_company_tabs(self) -> None:
+        if not self.company_notebook:
+            return
+        current_id = self.current_company_id
+        for tab in self.company_notebook.tabs():
+            frame = self.company_notebook.nametowidget(tab)
+            self.company_notebook.forget(tab)
+            frame.destroy()
+        for company in self.db.companies():
+            frame = ttk.Frame(self.company_notebook)
+            self.company_notebook.add(frame, text=str(company['name']))
+        companies = self.db.companies()
+        for idx, company in enumerate(companies):
+            if int(company['id']) == current_id:
+                self.company_notebook.select(idx)
+                break
+        self._on_company_tab_changed()
 
     def _build_fields_tab(self) -> None:
         toolbar = ttk.Frame(self.fields_tab, padding=10)
@@ -1257,7 +1445,7 @@ class OfflineDatabaseApp(tk.Tk):
 
     def refresh_data(self) -> None:
         fields = self.db.list_fields()
-        records = self.db.all_records()
+        records = self.db.all_records(self.current_company_id)
         record_links = {int(record['id']): self.db.get_record_links(int(record['id'])) for record in records}
         show_link_marker = bool(self.display_settings.get('show_link_marker', True))
         link_marker = str(self.display_settings.get('link_marker', LINK_MARKER)) or LINK_MARKER
@@ -1408,7 +1596,7 @@ class OfflineDatabaseApp(tk.Tk):
             return
         replace = messagebox.askyesno('匯入方式', '要先清除目前資料列再重新匯入嗎？\n選擇「是」只會清除資料列，會保留欄位名稱、欄位順序、欄寬、字體及其他設定。\n選擇「否」會保留現有資料，並在後方補入 Excel 資料。', parent=self)
         try:
-            fields, records = self.db.import_excel(Path(path), replace=replace)
+            fields, records = self.db.import_excel(Path(path), replace=replace, company_id=self.current_company_id)
             self.refresh_all()
             messagebox.showinfo('匯入完成', f'已處理 {fields} 個欄位、{records} 筆資料。', parent=self)
         except Exception as exc:
@@ -1520,7 +1708,7 @@ class OfflineDatabaseApp(tk.Tk):
         def save() -> None:
             values = {field_id: var.get() for field_id, var in variables.items()}
             try:
-                saved_record_id = record_id if record_id is not None else self.db.create_record(values)
+                saved_record_id = record_id if record_id is not None else self.db.create_record(values, company_id=self.current_company_id)
                 if record_id is not None:
                     self.db.update_record(record_id, values)
                 for field_id, link_var in link_variables.items():
@@ -1638,14 +1826,14 @@ class OfflineDatabaseApp(tk.Tk):
             form=ttk.Frame(dialog,padding=18); form.pack(fill='both',expand=True); form.columnconfigure(1,weight=1)
             vars_={'date':tk.StringVar(value='' if old is None else old['production_date']),'order':tk.StringVar(value='' if old is None else (old['order_quantity'] or old['quantity'])),'stock':tk.StringVar(value='' if old is None else old['stock_quantity']),'manufacturer':tk.StringVar(value='' if old is None else old['manufacturer']),'remark':tk.StringVar(value='' if old is None else old['remark']),'url':tk.StringVar(value='' if old is None else old['external_url'])}
             for i,(key,label) in enumerate([('date','生產日期'),('order','下單數量'),('stock','入庫數量')]): ttk.Label(form,text=label).grid(row=i,column=0,sticky='w',padx=(0,12),pady=6); ttk.Entry(form,textvariable=vars_[key],width=42).grid(row=i,column=1,sticky='ew',pady=6)
-            ttk.Label(form,text='製作廠商').grid(row=3,column=0,sticky='w',padx=(0,12),pady=6); combo=ttk.Combobox(form,textvariable=vars_['manufacturer'],width=39,state='normal',values=[r['name'] for r in self.db.production_manufacturers()]); combo.grid(row=3,column=1,sticky='ew',pady=6); ttk.Button(form,text='管理廠商',command=lambda:manage_manufacturers(dialog,combo)).grid(row=3,column=2,padx=(8,0),pady=6)
+            ttk.Label(form,text='製作廠商').grid(row=3,column=0,sticky='w',padx=(0,12),pady=6); combo=ttk.Combobox(form,textvariable=vars_['manufacturer'],width=39,state='normal',values=[r['name'] for r in self.db.production_manufacturers(self.current_company_id)]); combo.grid(row=3,column=1,sticky='ew',pady=6); ttk.Button(form,text='管理廠商',command=lambda:manage_manufacturers(dialog,combo)).grid(row=3,column=2,padx=(8,0),pady=6)
             ttk.Label(form,text='備註').grid(row=4,column=0,sticky='w',padx=(0,12),pady=6); ttk.Entry(form,textvariable=vars_['remark'],width=42).grid(row=4,column=1,sticky='ew',pady=6)
             ttk.Label(form,text='外部連結').grid(row=5,column=0,sticky='w',padx=(0,12),pady=6); ttk.Entry(form,textvariable=vars_['url'],width=42).grid(row=5,column=1,sticky='ew',pady=6); ttk.Label(form,text='例如：https://...',style='Hint.TLabel').grid(row=6,column=1,sticky='w')
             buttons=ttk.Frame(form); buttons.grid(row=7,column=0,columnspan=3,sticky='e',pady=(14,0))
             def save():
                 try:
                     if not vars_['date'].get().strip(): messagebox.showwarning('生產記錄','請輸入生產日期。',parent=dialog); return
-                    manufacturer=vars_['manufacturer'].get().strip(); self.db.ensure_production_manufacturer(manufacturer)
+                    manufacturer=vars_['manufacturer'].get().strip(); self.db.ensure_production_manufacturer(manufacturer, self.current_company_id)
                     if old is None: self.db.create_production_record(record_id,vars_['date'].get(),vars_['order'].get(),vars_['stock'].get(),manufacturer,vars_['remark'].get(),external_url=vars_['url'].get())
                     else: self.db.update_production_record(existing_id,vars_['date'].get(),vars_['order'].get(),vars_['stock'].get(),manufacturer,vars_['remark'].get(),external_url=vars_['url'].get())
                     dialog.destroy(); refresh()
