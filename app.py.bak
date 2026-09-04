@@ -1152,9 +1152,6 @@ class OfflineDatabaseApp(tk.Tk):
         for company in self.db.companies():
             frame = ttk.Frame(self.company_notebook)
             self.company_notebook.add(frame, text=str(company['name']))
-        # 最後一個「＋」是新增公司捷徑，不屬於實際公司分頁。
-        plus_frame = ttk.Frame(self.company_notebook)
-        self.company_notebook.add(plus_frame, text='＋')
         self.company_notebook.bind('<<NotebookTabChanged>>', self._on_company_tab_changed)
         companies = self.db.companies()
         for idx, company in enumerate(companies):
@@ -1207,11 +1204,6 @@ class OfflineDatabaseApp(tk.Tk):
         if selected in tabs:
             index = tabs.index(selected)
             companies = self.db.companies()
-            # 「＋」分頁：直接進入新增公司流程，完成後回到新公司的分頁。
-            if index == len(companies):
-                self._select_company_tab_by_id(self.current_company_id)
-                self._quick_add_company()
-                return
             if index < len(companies):
                 self.current_company_id = int(companies[index]['id'])
                 if hasattr(self, 'company_label_var'):
@@ -1220,29 +1212,6 @@ class OfflineDatabaseApp(tk.Tk):
                 self._sort_reverse = False
                 self.refresh_data()
                 self.status_var.set(f'目前公司：{companies[index]["name"]}')
-
-    def _select_company_tab_by_id(self, company_id: int) -> None:
-        if not self.company_notebook:
-            return
-        companies = self.db.companies()
-        for idx, company in enumerate(companies):
-            if int(company['id']) == int(company_id):
-                self.company_notebook.select(idx)
-                return
-
-    def _quick_add_company(self) -> None:
-        name = simpledialog.askstring('新增公司', '請輸入公司名稱：', parent=self)
-        if name is None:
-            self._select_company_tab_by_id(self.current_company_id)
-            return
-        try:
-            cid = self.db.add_company(name)
-            self.current_company_id = cid
-            self._rebuild_company_tabs()
-            self._select_company_tab_by_id(cid)
-        except ValueError as exc:
-            messagebox.showerror('新增公司', str(exc), parent=self)
-            self._select_company_tab_by_id(self.current_company_id)
 
     def manage_companies(self) -> None:
         dialog = tk.Toplevel(self)
@@ -1365,8 +1334,6 @@ class OfflineDatabaseApp(tk.Tk):
         for company in companies:
             frame = ttk.Frame(self.company_notebook)
             self.company_notebook.add(frame, text=str(company['name']))
-        plus_frame = ttk.Frame(self.company_notebook)
-        self.company_notebook.add(plus_frame, text='＋')
         companies = self.db.companies()
         for idx, company in enumerate(companies):
             if int(company['id']) == current_id:
