@@ -1247,7 +1247,7 @@ class OfflineDatabaseApp(tk.Tk):
     def manage_companies(self) -> None:
         dialog = tk.Toplevel(self)
         dialog.title('公司管理')
-        dialog.geometry('520x390')
+        dialog.geometry('560x430')
         dialog.resizable(False, False)
         dialog.transient(self)
         dialog.grab_set()
@@ -1332,12 +1332,12 @@ class OfflineDatabaseApp(tk.Tk):
             except ValueError as exc:
                 messagebox.showerror('刪除公司', str(exc), parent=dialog)
 
-        # 管理按鈕固定放在公司清單上方，讓新增／修改／刪除一眼就能找到。
+        # 管理按鈕固定放在公司清單上方，並使用一般文字，確保 Windows 上清楚顯示。
         buttons = ttk.Frame(body)
         buttons.pack(fill='x', pady=(0, 10))
-        ttk.Button(buttons, text='＋ 新增公司', command=add_company).pack(side='left')
-        ttk.Button(buttons, text='✎ 修改名稱', command=rename_selected).pack(side='left', padx=6)
-        ttk.Button(buttons, text='🗑 刪除公司', command=delete_selected).pack(side='left')
+        ttk.Button(buttons, text='新增公司', command=add_company).pack(side='left')
+        ttk.Button(buttons, text='修改名稱', command=rename_selected).pack(side='left', padx=6)
+        ttk.Button(buttons, text='刪除公司', command=delete_selected).pack(side='left')
 
         reload_list(self.current_company_id)
         footer = ttk.Frame(body)
