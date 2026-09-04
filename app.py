@@ -1128,8 +1128,11 @@ class OfflineDatabaseApp(tk.Tk):
         ttk.Label(header, text='SQLite／完全離線／單一使用者', style='Hint.TLabel').pack(side='left', padx=18)
         ttk.Label(header, textvariable=self.status_var, style='Hint.TLabel').pack(side='right')
 
-        notebook = ttk.Notebook(self)
-        notebook.pack(fill='both', expand=True, padx=12, pady=(0, 12))
+        # 主功能分頁列：公司管理按鈕固定放在「資料管理」分頁右側，方便直接找到。
+        notebook_bar = ttk.Frame(self, padding=(12, 0, 12, 0))
+        notebook_bar.pack(fill='x')
+        notebook = ttk.Notebook(notebook_bar)
+        notebook.pack(side='left', fill='x', expand=True)
         self.data_tab = ttk.Frame(notebook)
         self.fields_tab = ttk.Frame(notebook)
         self.lookup_tab = ttk.Frame(notebook)
@@ -1138,6 +1141,7 @@ class OfflineDatabaseApp(tk.Tk):
         notebook.add(self.fields_tab, text='欄位管理')
         notebook.add(self.lookup_tab, text='代碼／名稱對照')
         notebook.add(self.backup_tab, text='備份與還原')
+        ttk.Button(notebook_bar, text='公司管理', command=self.manage_companies).pack(side='left', padx=(8, 0), pady=(0, 4))
         self._build_data_tab()
         self._build_fields_tab()
         self._build_lookup_tab()
@@ -1158,8 +1162,7 @@ class OfflineDatabaseApp(tk.Tk):
             if int(company['id']) == self.current_company_id:
                 self.company_notebook.select(idx)
                 break
-        ttk.Button(company_bar, text='公司管理', command=self.manage_companies).pack(side='left', padx=10)
-        ttk.Label(company_bar, text='目前公司：', style='Hint.TLabel').pack(side='left', padx=(8, 0))
+        ttk.Label(company_bar, text='目前公司：', style='Hint.TLabel').pack(side='left', padx=(10, 0))
         self.company_label_var = tk.StringVar()
         ttk.Label(company_bar, textvariable=self.company_label_var, font=('Microsoft JhengHei UI', 10, 'bold')).pack(side='left', padx=(4, 0))
 
@@ -1223,7 +1226,11 @@ class OfflineDatabaseApp(tk.Tk):
         body = ttk.Frame(dialog, padding=16)
         body.pack(fill='both', expand=True)
         ttk.Label(body, text='公司管理', style='Title.TLabel').pack(anchor='w')
-        ttk.Label(body, text='可新增、修改或刪除公司。刪除公司前，必須先清空該公司的資料。', style='Hint.TLabel').pack(anchor='w', pady=(4, 12))
+        ttk.Label(body, text='可新增、修改或刪除公司。刪除公司前，必須先清空該公司的資料。', style='Hint.TLabel').pack(anchor='w', pady=(4, 10))
+
+        # 操作按鈕固定放在清單上方，避免視窗高度或螢幕縮放造成按鈕看不到。
+        action_bar = ttk.Frame(body)
+        action_bar.pack(fill='x', pady=(0, 10))
 
         list_frame = ttk.Frame(body)
         list_frame.pack(fill='both', expand=True)
@@ -1300,12 +1307,10 @@ class OfflineDatabaseApp(tk.Tk):
             except ValueError as exc:
                 messagebox.showerror('刪除公司', str(exc), parent=dialog)
 
-        buttons = ttk.Frame(body)
-        buttons.pack(fill='x', pady=(12, 0))
-        ttk.Button(buttons, text='新增公司', command=add_company).pack(side='left')
-        ttk.Button(buttons, text='修改名稱', command=rename_selected).pack(side='left', padx=6)
-        ttk.Button(buttons, text='刪除公司', command=delete_selected).pack(side='left')
-        ttk.Button(buttons, text='關閉', command=dialog.destroy).pack(side='right')
+        ttk.Button(action_bar, text='新增公司', command=add_company).pack(side='left')
+        ttk.Button(action_bar, text='修改名稱', command=rename_selected).pack(side='left', padx=6)
+        ttk.Button(action_bar, text='刪除公司', command=delete_selected).pack(side='left')
+        ttk.Button(action_bar, text='關閉', command=dialog.destroy).pack(side='right')
 
         reload_list(self.current_company_id)
         dialog.wait_window()
