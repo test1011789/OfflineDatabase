@@ -5,6 +5,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -796,6 +797,191 @@ class Database:
         term = pair['term'] if pair else ''
         self.set_value(record_id, int(term_field['id']), term)
 
+    def _field_backup_payload(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT id, name, kind, options_json, color_map_json, position, system_key, builtin, active FROM fields ORDER BY position, id"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def backup_system_interface(self, destination: Path | None = None) -> Path:
+        self.conn.commit()
+        if destination is None:
+            stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            destination = self.backup_dir / f'系統介面_{stamp}.sbackup'
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            'backup_type': 'system_interface',
+            'version': 1,
+            'created_at': datetime.now().isoformat(timespec='seconds'),
+            'fields': self._field_backup_payload(),
+            'lookup_pairs': [dict(row) for row in self.conn.execute(
+                "SELECT code, term, position FROM lookup_pairs ORDER BY position, id"
+            ).fetchall()],
+            'display_settings': self.get_display_settings(),
+        }
+        with zipfile.ZipFile(destination, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr('backup.json', json.dumps(payload, ensure_ascii=False, indent=2))
+        return destination
+
+    def restore_system_interface(self, source: Path) -> None:
+        source = Path(source)
+        with zipfile.ZipFile(source, 'r') as zf:
+            payload = json.loads(zf.read('backup.json').decode('utf-8'))
+        if payload.get('backup_type') != 'system_interface':
+            raise ValueError('這不是「系統介面」備份檔。')
+        current_by_key = {
+            str(row['system_key']): int(row['id'])
+            for row in self.conn.execute("SELECT id, system_key FROM fields WHERE system_key IS NOT NULL AND TRIM(system_key) <> ''")
+        }
+        current_by_name = {
+            str(row['name']): int(row['id'])
+            for row in self.conn.execute("SELECT id, name FROM fields")
+        }
+        for field in payload.get('fields', []):
+            sid = str(field.get('system_key') or '').strip()
+            name = str(field.get('name') or '').strip()
+            field_id = current_by_key.get(sid) if sid else current_by_name.get(name)
+            values = (
+                name, str(field.get('kind') or 'text'), str(field.get('options_json') or '[]'),
+                str(field.get('color_map_json') or '{}'), int(field.get('position') or 0),
+                sid or None, int(field.get('builtin') or 0), int(field.get('active', 1)),
+            )
+            if field_id is None:
+                self.conn.execute(
+                    """INSERT INTO fields(name, kind, options_json, color_map_json, position, system_key, builtin, active)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", values
+                )
+            else:
+                self.conn.execute(
+                    """UPDATE fields SET name=?, kind=?, options_json=?, color_map_json=?, position=?,
+                       system_key=?, builtin=?, active=? WHERE id=?""", values + (field_id,)
+                )
+        self.conn.execute('DELETE FROM lookup_pairs')
+        for pair in payload.get('lookup_pairs', []):
+            self.conn.execute(
+                'INSERT INTO lookup_pairs(code, term, position) VALUES (?, ?, ?)',
+                (str(pair.get('code') or ''), str(pair.get('term') or ''), int(pair.get('position') or 0)),
+            )
+        self.save_display_settings(dict(payload.get('display_settings') or {}))
+        self.conn.commit()
+
+    def backup_company(self, company_id: int, destination: Path | None = None) -> Path:
+        company_id = int(company_id)
+        company = self.conn.execute('SELECT id, name, position FROM companies WHERE id = ?', (company_id,)).fetchone()
+        if not company:
+            raise ValueError('找不到要備份的公司。')
+        if destination is None:
+            safe_name = ''.join(ch for ch in str(company['name']) if ch not in r'\/:*?"<>|').strip() or f'公司_{company_id}'
+            stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            destination = self.backup_dir / f'公司_{safe_name}_{stamp}.cbackup'
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        records = []
+        for record in self.conn.execute(
+            'SELECT id, created_at, updated_at FROM records WHERE company_id = ? ORDER BY id', (company_id,)
+        ).fetchall():
+            record_id = int(record['id'])
+            values = []
+            for row in self.conn.execute(
+                """SELECT f.name, f.system_key, rv.value FROM record_values rv
+                   JOIN fields f ON f.id = rv.field_id WHERE rv.record_id = ?""", (record_id,)
+            ).fetchall():
+                values.append({'field_name': str(row['name']), 'system_key': str(row['system_key'] or ''), 'value': row['value']})
+            links = []
+            for row in self.conn.execute(
+                """SELECT f.name, f.system_key, rl.url FROM record_links rl
+                   JOIN fields f ON f.id = rl.field_id WHERE rl.record_id = ?""", (record_id,)
+            ).fetchall():
+                links.append({'field_name': str(row['name']), 'system_key': str(row['system_key'] or ''), 'url': str(row['url'])})
+            production = [dict(row) for row in self.conn.execute(
+                """SELECT production_date, batch_no, quantity, order_quantity, stock_quantity, manufacturer, remark, external_url, created_at, updated_at
+                   FROM production_records WHERE record_id = ? ORDER BY production_date DESC, id DESC""", (record_id,)
+            ).fetchall()]
+            records.append({'created_at': str(record['created_at']), 'updated_at': str(record['updated_at']), 'values': values, 'links': links, 'production': production})
+        payload = {
+            'backup_type': 'company',
+            'version': 1,
+            'created_at': datetime.now().isoformat(timespec='seconds'),
+            'company': dict(company),
+            'manufacturers': [dict(row) for row in self.conn.execute(
+                'SELECT name, position FROM production_manufacturers WHERE company_id = ? ORDER BY position, id', (company_id,)
+            ).fetchall()],
+            'records': records,
+        }
+        with zipfile.ZipFile(destination, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr('backup.json', json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+        return destination
+
+    def restore_company(self, source: Path) -> int:
+        source = Path(source)
+        with zipfile.ZipFile(source, 'r') as zf:
+            payload = json.loads(zf.read('backup.json').decode('utf-8'))
+        if payload.get('backup_type') != 'company':
+            raise ValueError('這不是「公司」備份檔。')
+        company_data = payload.get('company') or {}
+        company_name = str(company_data.get('name') or '').strip()
+        if not company_name:
+            raise ValueError('公司備份檔缺少公司名稱。')
+        existing = self.conn.execute('SELECT id FROM companies WHERE name = ?', (company_name,)).fetchone()
+        if existing:
+            company_id = int(existing['id'])
+        else:
+            position = int(company_data.get('position') or 0)
+            cursor = self.conn.execute('INSERT INTO companies(name, position) VALUES (?, ?)', (company_name, position))
+            company_id = int(cursor.lastrowid)
+        old_record_ids = [int(row['id']) for row in self.conn.execute('SELECT id FROM records WHERE company_id = ?', (company_id,)).fetchall()]
+        if old_record_ids:
+            placeholders = ','.join('?' for _ in old_record_ids)
+            self.conn.execute(f'DELETE FROM records WHERE id IN ({placeholders})', old_record_ids)
+        self.conn.execute('DELETE FROM production_manufacturers WHERE company_id = ?', (company_id,))
+        for manufacturer in payload.get('manufacturers', []):
+            self.conn.execute(
+                'INSERT INTO production_manufacturers(name, company_id, position) VALUES (?, ?, ?)',
+                (str(manufacturer.get('name') or ''), company_id, int(manufacturer.get('position') or 0)),
+            )
+        current_by_key = {
+            str(row['system_key']): int(row['id'])
+            for row in self.conn.execute("SELECT id, system_key FROM fields WHERE system_key IS NOT NULL AND TRIM(system_key) <> ''")
+        }
+        current_by_name = {str(row['name']): int(row['id']) for row in self.conn.execute('SELECT id, name FROM fields')}
+        for record in payload.get('records', []):
+            now = datetime.now().isoformat(timespec='seconds')
+            cursor = self.conn.execute(
+                'INSERT INTO records(created_at, updated_at, company_id) VALUES (?, ?, ?)',
+                (str(record.get('created_at') or now), str(record.get('updated_at') or now), company_id),
+            )
+            record_id = int(cursor.lastrowid)
+            for item in record.get('values', []):
+                sid = str(item.get('system_key') or '').strip()
+                name = str(item.get('field_name') or '').strip()
+                field_id = current_by_key.get(sid) if sid else current_by_name.get(name)
+                if field_id is not None:
+                    self.conn.execute(
+                        'INSERT OR REPLACE INTO record_values(record_id, field_id, value) VALUES (?, ?, ?)',
+                        (record_id, field_id, item.get('value')),
+                    )
+            for item in record.get('links', []):
+                sid = str(item.get('system_key') or '').strip()
+                name = str(item.get('field_name') or '').strip()
+                field_id = current_by_key.get(sid) if sid else current_by_name.get(name)
+                if field_id is not None and str(item.get('url') or '').strip():
+                    self.conn.execute(
+                        'INSERT OR REPLACE INTO record_links(record_id, field_id, url) VALUES (?, ?, ?)',
+                        (record_id, field_id, str(item.get('url'))),
+                    )
+            for item in record.get('production', []):
+                self.conn.execute(
+                    """INSERT INTO production_records(record_id, production_date, batch_no, quantity, order_quantity, stock_quantity, manufacturer, remark, external_url, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (record_id, str(item.get('production_date') or ''), str(item.get('batch_no') or ''),
+                     str(item.get('quantity') or item.get('order_quantity') or ''), str(item.get('order_quantity') or ''),
+                     str(item.get('stock_quantity') or ''), str(item.get('manufacturer') or ''), str(item.get('remark') or ''),
+                     str(item.get('external_url') or ''), str(item.get('created_at') or now), str(item.get('updated_at') or now)),
+                )
+        self.conn.commit()
+        return company_id
+
     def backup(self, destination: Path | None = None) -> Path:
         self.conn.commit()
         if destination is None:
@@ -1469,12 +1655,22 @@ class OfflineDatabaseApp(tk.Tk):
     def _build_backup_tab(self) -> None:
         frame = ttk.Frame(self.backup_tab, padding=24)
         frame.pack(fill='both', expand=True, anchor='nw')
-        ttk.Label(frame, text='資料庫檔案位置', font=('Microsoft JhengHei UI', 11, 'bold')).pack(anchor='w')
-        ttk.Label(frame, text=str(self.db.path), style='Hint.TLabel').pack(anchor='w', pady=(6, 20))
-        ttk.Label(frame, text='備份與還原會直接處理整個 SQLite 資料庫，建議定期備份 data\app.db。', style='Hint.TLabel').pack(anchor='w', pady=(0, 14))
-        ttk.Button(frame, text='立即備份到程式 backup 資料夾', command=self.backup_now).pack(anchor='w', pady=5)
-        ttk.Button(frame, text='另存備份檔', command=self.backup_as).pack(anchor='w', pady=5)
-        ttk.Button(frame, text='從備份檔還原', command=self.restore_backup).pack(anchor='w', pady=5)
+        ttk.Label(frame, text='備份與還原', font=('Microsoft JhengHei UI', 14, 'bold')).pack(anchor='w')
+        ttk.Label(frame, text='現在分成「系統介面」與「公司」兩種獨立備份。系統介面不包含公司資料；公司備份只包含單一公司。', style='Hint.TLabel', wraplength=900).pack(anchor='w', pady=(6, 18))
+        system_box = ttk.LabelFrame(frame, text='系統介面', padding=16)
+        system_box.pack(fill='x', pady=(0, 14))
+        ttk.Label(system_box, text='包含：欄位設定、欄位順序、欄位選項／顏色、代碼／名稱對照、畫面顯示設定。', style='Hint.TLabel').pack(anchor='w', pady=(0, 10))
+        system_buttons = ttk.Frame(system_box)
+        system_buttons.pack(fill='x')
+        ttk.Button(system_buttons, text='備份系統介面', command=self.backup_system_interface).pack(side='left')
+        ttk.Button(system_buttons, text='還原系統介面', command=self.restore_system_interface).pack(side='left', padx=8)
+        company_box = ttk.LabelFrame(frame, text='公司', padding=16)
+        company_box.pack(fill='x')
+        ttk.Label(company_box, text='目前公司：', font=('Microsoft JhengHei UI', 10, 'bold')).pack(side='left')
+        ttk.Label(company_box, textvariable=self.company_label_var).pack(side='left', padx=(6, 20))
+        ttk.Label(company_box, text='公司備份只包含目前公司本身的主資料、生產履歷與廠商。', style='Hint.TLabel').pack(side='left', padx=(0, 10))
+        ttk.Button(company_box, text='備份目前公司', command=self.backup_current_company).pack(side='right', padx=4)
+        ttk.Button(company_box, text='還原公司備份', command=self.restore_company_backup).pack(side='right', padx=4)
 
     def refresh_all(self) -> None:
         self.refresh_data()
@@ -2113,35 +2309,86 @@ class OfflineDatabaseApp(tk.Tk):
             self.db.delete_lookup(lookup_id)
             self.refresh_all()
 
-    def backup_now(self) -> None:
-        try:
-            target = self.db.backup()
-            messagebox.showinfo('備份完成', f'備份檔已建立：\n{target}', parent=self)
-        except Exception as exc:
-            messagebox.showerror('備份失敗', str(exc), parent=self)
-
-    def backup_as(self) -> None:
-        target = filedialog.asksaveasfilename(title='另存資料庫備份', defaultextension='.db', filetypes=[('SQLite 資料庫', '*.db'), ('所有檔案', '*.*')])
+    def backup_system_interface(self) -> None:
+        target = filedialog.asksaveasfilename(title='備份系統介面', defaultextension='.sbackup', initialfile=f'系統介面_{datetime.now().strftime("%Y%m%d_%H%M%S")}.sbackup', filetypes=[('系統介面備份', '*.sbackup'), ('所有檔案', '*.*')])
         if not target:
             return
         try:
-            self.db.backup(Path(target))
-            messagebox.showinfo('備份完成', f'已儲存至：\n{target}', parent=self)
+            target_path = self.db.backup_system_interface(Path(target))
+            messagebox.showinfo('備份完成', f'系統介面備份已建立：\n{target_path}', parent=self)
         except Exception as exc:
             messagebox.showerror('備份失敗', str(exc), parent=self)
 
-    def restore_backup(self) -> None:
-        source = filedialog.askopenfilename(title='選擇資料庫備份', filetypes=[('SQLite 資料庫', '*.db'), ('所有檔案', '*.*')])
+    def restore_system_interface(self) -> None:
+        source = filedialog.askopenfilename(title='選擇系統介面備份', filetypes=[('系統介面備份', '*.sbackup'), ('所有檔案', '*.*')])
         if not source:
             return
-        if not messagebox.askyesno('還原資料庫', '還原會覆蓋目前資料，確定繼續嗎？', parent=self):
+        if not messagebox.askyesno('還原系統介面', '這會還原欄位、代碼／名稱對照與顯示設定，但不會修改任何公司資料。\n確定繼續嗎？', parent=self):
             return
         try:
-            self.db.restore(Path(source))
+            self.db.restore_system_interface(Path(source))
+            self.display_settings = self.db.get_display_settings()
+            self._apply_display_settings()
             self.refresh_all()
-            messagebox.showinfo('還原完成', '資料庫已還原。', parent=self)
+            messagebox.showinfo('還原完成', '系統介面已還原，所有公司資料均保留。', parent=self)
         except Exception as exc:
             messagebox.showerror('還原失敗', str(exc), parent=self)
+
+    def backup_current_company(self) -> None:
+        company = self.db.conn.execute('SELECT name FROM companies WHERE id = ?', (self.current_company_id,)).fetchone()
+        if not company:
+            messagebox.showerror('公司備份', '找不到目前公司。', parent=self)
+            return
+        safe_name = ''.join(ch for ch in str(company['name']) if ch not in r'\/:*?"<>|').strip() or '公司'
+        target = filedialog.asksaveasfilename(title='備份目前公司', defaultextension='.cbackup', initialfile=f'公司_{safe_name}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.cbackup', filetypes=[('公司備份', '*.cbackup'), ('所有檔案', '*.*')])
+        if not target:
+            return
+        try:
+            target_path = self.db.backup_company(self.current_company_id, Path(target))
+            messagebox.showinfo('備份完成', f'「{company["name"]}」的公司備份已建立：\n{target_path}\n\n其他公司資料沒有被包含在此備份中。', parent=self)
+        except Exception as exc:
+            messagebox.showerror('備份失敗', str(exc), parent=self)
+
+    def restore_company_backup(self) -> None:
+        source = filedialog.askopenfilename(title='選擇公司備份', filetypes=[('公司備份', '*.cbackup'), ('所有檔案', '*.*')])
+        if not source:
+            return
+        try:
+            with zipfile.ZipFile(source, 'r') as zf:
+                payload = json.loads(zf.read('backup.json').decode('utf-8'))
+            if payload.get('backup_type') != 'company':
+                raise ValueError('這不是「公司」備份檔。')
+            name = str((payload.get('company') or {}).get('name') or '').strip()
+        except Exception as exc:
+            messagebox.showerror('公司還原', str(exc), parent=self)
+            return
+        if not name:
+            messagebox.showerror('公司還原', '備份檔沒有有效的公司名稱。', parent=self)
+            return
+        existing = self.db.conn.execute('SELECT id FROM companies WHERE name = ?', (name,)).fetchone()
+        if existing:
+            prompt = f'備份檔中的公司是「{name}」。\n\n目前系統已有同名公司。還原後只會清除並重建這家公司的資料，其他公司完全不受影響。\n\n確定還原嗎？'
+        else:
+            prompt = f'要還原公司「{name}」嗎？\n\n若目前沒有這家公司，系統會自動新增；其他公司完全不受影響。'
+        if not messagebox.askyesno('還原公司', prompt, parent=self):
+            return
+        try:
+            company_id = self.db.restore_company(Path(source))
+            self.current_company_id = company_id
+            self._rebuild_company_tabs()
+            self.refresh_all()
+            messagebox.showinfo('還原完成', f'公司「{name}」已完成還原。\n其他公司的資料與系統介面設定均未被覆蓋。', parent=self)
+        except Exception as exc:
+            messagebox.showerror('還原失敗', str(exc), parent=self)
+
+    def backup_now(self) -> None:
+        self.backup_system_interface()
+
+    def backup_as(self) -> None:
+        self.backup_current_company()
+
+    def restore_backup(self) -> None:
+        self.restore_company_backup()
 
     def _on_close(self) -> None:
         self._save_current_column_widths()
