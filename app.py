@@ -45,6 +45,11 @@ DEFAULT_CATEGORY_COLORS = {
 DEFAULT_COLUMN_WIDTH = 140
 FIXED_UI_FONT_SIZE = 10
 
+LEGACY_FIELD_ALIASES = {
+    '含量': '含量\nAI',
+    '普通名稱': '中文普通名稱\ncommon name',
+}
+
 BUILTIN_FIELD_KEYS = {
     '核准': 'approval',
     '生產': 'production',
@@ -982,6 +987,108 @@ class Database:
         self.conn.commit()
         return company_id
 
+    def inspect_legacy_data_db(self, source: Path) -> dict[str, Any]:
+        source = Path(source)
+        if not source.exists():
+            raise ValueError('找不到指定的舊版 DB 檔案。')
+        legacy = None
+        try:
+            legacy = sqlite3.connect(f'file:{source.as_posix()}?mode=ro', uri=True)
+            legacy.row_factory = sqlite3.Row
+            tables = {str(r['name']) for r in legacy.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if not {'records', 'record_values'}.issubset(tables):
+                raise ValueError('這個 DB 不是可辨識的舊版資料庫，找不到「資料管理」資料表。')
+            record_count = int(legacy.execute('SELECT COUNT(*) AS n FROM records').fetchone()['n'])
+            value_count = int(legacy.execute('SELECT COUNT(*) AS n FROM record_values').fetchone()['n'])
+            link_count = int(legacy.execute('SELECT COUNT(*) AS n FROM record_links').fetchone()['n']) if 'record_links' in tables else 0
+            production_count = int(legacy.execute('SELECT COUNT(*) AS n FROM production_records').fetchone()['n']) if 'production_records' in tables else 0
+            return {'record_count': record_count, 'value_count': value_count, 'link_count': link_count, 'production_count': production_count}
+        except sqlite3.Error as exc:
+            raise ValueError(f'無法讀取舊版 DB：{exc}') from exc
+        finally:
+            if legacy is not None:
+                legacy.close()
+
+    def import_legacy_data(self, source: Path, company_id: int, replace: bool = False) -> dict[str, int]:
+        source = Path(source)
+        company_id = int(company_id)
+        if not self.conn.execute('SELECT 1 FROM companies WHERE id = ?', (company_id,)).fetchone():
+            raise ValueError('找不到要匯入的公司。')
+        legacy = None
+        try:
+            legacy = sqlite3.connect(f'file:{source.as_posix()}?mode=ro', uri=True)
+            legacy.row_factory = sqlite3.Row
+            tables = {str(r['name']) for r in legacy.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if not {'records', 'record_values'}.issubset(tables):
+                raise ValueError('這個 DB 不是可辨識的舊版資料庫，找不到「資料管理」資料表。')
+            legacy_fields = {}
+            if 'fields' in tables:
+                legacy_fields = {int(r['id']): {'name': str(r['name'] or '').strip(), 'system_key': str(r['system_key'] or '').strip()} for r in legacy.execute('SELECT id, name, system_key FROM fields').fetchall()}
+            current_by_key = {str(r['system_key']): int(r['id']) for r in self.conn.execute("SELECT id, system_key FROM fields WHERE system_key IS NOT NULL AND TRIM(system_key) <> ''")}
+            current_by_name = {str(r['name']): int(r['id']) for r in self.conn.execute('SELECT id, name FROM fields')}
+            legacy_records = legacy.execute('SELECT id, created_at, updated_at FROM records ORDER BY id').fetchall()
+            counts = {'records': 0, 'values': 0, 'links': 0, 'production': 0, 'unmapped_values': 0}
+            self.conn.execute('BEGIN')
+            if replace:
+                self.conn.execute('DELETE FROM records WHERE company_id = ?', (company_id,))
+            legacy_to_new = {}
+            for old in legacy_records:
+                now = datetime.now().isoformat(timespec='seconds')
+                cur = self.conn.execute('INSERT INTO records(created_at, updated_at, company_id) VALUES (?, ?, ?)', (str(old['created_at'] or now), str(old['updated_at'] or now), company_id))
+                legacy_to_new[int(old['id'])] = int(cur.lastrowid)
+                counts['records'] += 1
+            for row in legacy.execute('SELECT record_id, field_id, value FROM record_values').fetchall():
+                new_id = legacy_to_new.get(int(row['record_id']))
+                info = legacy_fields.get(int(row['field_id']), {})
+                key = str(info.get('system_key') or '').strip(); name = str(info.get('name') or '').strip()
+                field_id = current_by_key.get(key) if key else current_by_name.get(name)
+                if field_id is None and name:
+                    field_id = current_by_name.get(LEGACY_FIELD_ALIASES.get(name, name))
+                if new_id is None: continue
+                if field_id is None:
+                    counts['unmapped_values'] += 1
+                    continue
+                self.conn.execute('INSERT OR REPLACE INTO record_values(record_id, field_id, value) VALUES (?, ?, ?)', (new_id, field_id, '' if row['value'] is None else str(row['value'])))
+                counts['values'] += 1
+            if 'record_links' in tables:
+                for row in legacy.execute('SELECT record_id, field_id, url FROM record_links').fetchall():
+                    new_id = legacy_to_new.get(int(row['record_id']))
+                    if new_id is None or not str(row['url'] or '').strip(): continue
+                    info = legacy_fields.get(int(row['field_id']), {})
+                    key = str(info.get('system_key') or '').strip(); name = str(info.get('name') or '').strip()
+                    field_id = current_by_key.get(key) if key else current_by_name.get(name)
+                    if field_id is None: field_id = current_by_name.get(LEGACY_FIELD_ALIASES.get(name, name))
+                    if field_id is None: continue
+                    self.conn.execute('INSERT OR REPLACE INTO record_links(record_id, field_id, url) VALUES (?, ?, ?)', (new_id, field_id, str(row['url'])))
+                    counts['links'] += 1
+            if 'production_records' in tables:
+                prod_cols = {str(r['name']) for r in legacy.execute('PRAGMA table_info(production_records)').fetchall()}
+                select_cols = [c for c in ['record_id','production_date','batch_no','quantity','order_quantity','stock_quantity','manufacturer','remark','external_url','created_at','updated_at'] if c in prod_cols]
+                for row in legacy.execute(f"SELECT {', '.join(select_cols)} FROM production_records").fetchall():
+                    new_id = legacy_to_new.get(int(row['record_id']))
+                    if new_id is None: continue
+                    now = datetime.now().isoformat(timespec='seconds')
+                    def rv(name, default=''): return row[name] if name in row.keys() and row[name] is not None else default
+                    qty = str(rv('quantity') or rv('order_quantity'))
+                    order_qty = str(rv('order_quantity') or qty)
+                    self.conn.execute('INSERT INTO production_records(record_id, production_date, batch_no, quantity, order_quantity, stock_quantity, manufacturer, remark, external_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (new_id, str(rv('production_date')), str(rv('batch_no')), qty, order_qty, str(rv('stock_quantity')), str(rv('manufacturer')), str(rv('remark')), str(rv('external_url')), str(rv('created_at', now)), str(rv('updated_at', now))))
+                    counts['production'] += 1
+                # 舊版生產廠商也屬於資料管理的操作資料，帶入目前公司的廠商清單。
+                if 'production_manufacturers' in tables:
+                    for row in legacy.execute('SELECT name, position FROM production_manufacturers').fetchall():
+                        name = str(row['name'] or '').strip()
+                        if not name:
+                            continue
+                        pos = int(row['position'] or 0)
+                        self.conn.execute('INSERT OR IGNORE INTO production_manufacturers(name, company_id, position) VALUES (?, ?, ?)', (name, company_id, pos))
+            self.conn.commit()
+            return counts
+        except Exception:
+            self.conn.rollback()
+            raise
+        finally:
+            if legacy is not None:
+                legacy.close()
     def backup(self, destination: Path | None = None) -> Path:
         self.conn.commit()
         if destination is None:
@@ -1671,6 +1778,11 @@ class OfflineDatabaseApp(tk.Tk):
         ttk.Label(company_box, text='公司備份只包含目前公司本身的主資料、生產履歷與廠商。', style='Hint.TLabel').pack(side='left', padx=(0, 10))
         ttk.Button(company_box, text='備份目前公司', command=self.backup_current_company).pack(side='right', padx=4)
         ttk.Button(company_box, text='還原公司備份', command=self.restore_company_backup).pack(side='right', padx=4)
+
+        legacy_box = ttk.LabelFrame(frame, text='舊版 DB 資料匯入', padding=16)
+        legacy_box.pack(fill='x', pady=(14, 0))
+        ttk.Label(legacy_box, text='只讀取舊版 .db 的「資料管理」資料，不會匯入舊版欄位管理、代碼／名稱對照或介面設定。', style='Hint.TLabel', wraplength=900).pack(anchor='w', pady=(0, 10))
+        ttk.Button(legacy_box, text='匯入舊版 DB（資料管理）', command=self.import_legacy_db_data).pack(side='left')
 
     def refresh_all(self) -> None:
         self.refresh_data()
@@ -2380,6 +2492,56 @@ class OfflineDatabaseApp(tk.Tk):
             messagebox.showinfo('還原完成', f'公司「{name}」已完成還原。\n其他公司的資料與系統介面設定均未被覆蓋。', parent=self)
         except Exception as exc:
             messagebox.showerror('還原失敗', str(exc), parent=self)
+
+    def import_legacy_db_data(self) -> None:
+        source = filedialog.askopenfilename(title='選擇舊版 DB', filetypes=[('SQLite DB', '*.db'), ('所有檔案', '*.*')])
+        if not source:
+            return
+        try:
+            info = self.db.inspect_legacy_data_db(Path(source))
+        except Exception as exc:
+            messagebox.showerror('舊版 DB 匯入', str(exc), parent=self)
+            return
+
+        companies = self.db.companies()
+        company_names = [str(row['name']) for row in companies]
+        default_name = str(self.company_label_var.get() or '')
+        company_name = simpledialog.askstring('匯入舊版 DB', '請輸入要匯入哪家公司？\n可直接輸入現有公司名稱。', initialvalue=default_name, parent=self)
+        if not company_name:
+            return
+        company_name = company_name.strip()
+        company = next((row for row in companies if str(row['name']) == company_name), None)
+        if company is None:
+            if not messagebox.askyesno('建立公司', f'找不到公司「{company_name}」。\n\n是否先建立這家公司，再將舊 DB 資料匯入？', parent=self):
+                return
+            try:
+                company_id = self.db.add_company(company_name)
+            except Exception as exc:
+                messagebox.showerror('建立公司失敗', str(exc), parent=self)
+                return
+        else:
+            company_id = int(company['id'])
+
+        summary = (
+            f'舊 DB 資料管理內容：\n'
+            f'主資料：{info["record_count"]} 筆\n'
+            f'欄位值：{info["value_count"]} 筆\n'
+            f'連結：{info["link_count"]} 筆\n'
+            f'生產履歷：{info["production_count"]} 筆\n\n'
+            f'匯入目標：{company_name}\n\n'
+            '預設採「新增匯入」，不會刪除該公司的現有資料。是否開始匯入？'
+        )
+        if not messagebox.askyesno('確認匯入', summary, parent=self):
+            return
+        try:
+            result = self.db.import_legacy_data(Path(source), company_id, replace=False)
+            self.current_company_id = company_id
+            self._rebuild_company_tabs()
+            self.refresh_all()
+            extra = f'\n有 {result["unmapped_values"]} 筆欄位值無法對應到目前欄位，已略過。' if result['unmapped_values'] else ''
+            messagebox.showinfo('匯入完成', f'已匯入「{company_name}」：\n主資料 {result["records"]} 筆\n欄位值 {result["values"]} 筆\n連結 {result["links"]} 筆\n生產履歷 {result["production"]} 筆{extra}', parent=self)
+        except Exception as exc:
+            messagebox.showerror('匯入失敗', str(exc), parent=self)
 
     def backup_now(self) -> None:
         self.backup_system_interface()
