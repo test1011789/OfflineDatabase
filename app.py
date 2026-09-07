@@ -739,7 +739,7 @@ class Database:
         self.conn.commit()
 
     def delete_production_manufacturer(self, manufacturer_id: int) -> None:
-        row = self.conn.execute('SELECT name FROM production_manufacturers WHERE id = ?', (int(manufacturer_id),)).fetchone()
+        row = self.conn.execute('SELECT name, company_id FROM production_manufacturers WHERE id = ?', (int(manufacturer_id),)).fetchone()
         if not row:
             return
         name = str(row['name'])
@@ -2269,6 +2269,122 @@ class OfflineDatabaseApp(tk.Tk):
                 order=str(row['order_quantity'] or row['quantity'] or ''); stock=str(row['stock_quantity'] or ''); data={'date':str(row['production_date'] or ''),'order':order,'stock':stock,'manufacturer':str(row['manufacturer'] or ''),'remark':str(row['remark'] or '')}; action='開啟連結 ／ 刪除' if str(row['external_url'] or '').strip() else '無連結 ／ 刪除'; tags=('abnormal',) if mismatch(order,stock) else ()
                 table.insert('', 'end', iid=str(row['id']), values=[f'{index:02d}']+[data[key] for key in visible]+[action], tags=tags)
             table.tag_configure('abnormal',background='#FCE4E4'); page_count=max(1,max_page+1); page_info.set(f'第 {page+1} / {page_count} 頁  （每頁 {page_size} 筆）'); prev_btn.config(state='normal' if page>0 else 'disabled'); next_btn.config(state='normal' if page<max_page else 'disabled'); self.refresh_data()
+        def manage_manufacturers(parent_dialog=None, combo=None):
+            # 管理目前公司的製作廠商。
+            company_id = int(self.current_company_id or self.db.default_company_id())
+            dialog = tk.Toplevel(parent_dialog or win)
+            dialog.title('管理製作廠商')
+            dialog.geometry('560x430')
+            dialog.minsize(500, 360)
+            dialog.transient(parent_dialog or win)
+
+            body = ttk.Frame(dialog, padding=16)
+            body.pack(fill='both', expand=True)
+            ttk.Label(body, text='製作廠商', style='ProductionSection.TLabel').pack(anchor='w', pady=(0, 10))
+
+            frame = ttk.Frame(body)
+            frame.pack(fill='both', expand=True)
+            tree = ttk.Treeview(frame, columns=('id', 'name'), show='headings', selectmode='browse', height=12)
+            tree.heading('id', text='編號', anchor='center')
+            tree.heading('name', text='廠商名稱', anchor='w')
+            tree.column('id', width=70, anchor='center', stretch=False)
+            tree.column('name', width=360, anchor='w', stretch=True)
+            scroll = ttk.Scrollbar(frame, orient='vertical', command=tree.yview)
+            tree.configure(yscrollcommand=scroll.set)
+            tree.grid(row=0, column=0, sticky='nsew')
+            scroll.grid(row=0, column=1, sticky='ns')
+            frame.rowconfigure(0, weight=1)
+            frame.columnconfigure(0, weight=1)
+
+            def refresh_manufacturers(select_name=None):
+                tree.delete(*tree.get_children())
+                rows = self.db.production_manufacturers(company_id)
+                select_iid = None
+                names = []
+                for row in rows:
+                    iid = str(row['id'])
+                    name = str(row['name'] or '')
+                    names.append(name)
+                    tree.insert('', 'end', iid=iid, values=(iid, name))
+                    if select_name is not None and name == select_name:
+                        select_iid = iid
+                if select_iid:
+                    tree.selection_set(select_iid)
+                    tree.focus(select_iid)
+                    tree.see(select_iid)
+                if combo is not None:
+                    combo['values'] = names
+
+            def selected_row():
+                sel = tree.selection()
+                if not sel:
+                    return None
+                row_id = int(sel[0])
+                return self.db.conn.execute(
+                    'SELECT id, name FROM production_manufacturers WHERE id = ? AND company_id = ?',
+                    (row_id, company_id),
+                ).fetchone()
+
+            def add_manufacturer():
+                name = simpledialog.askstring('新增製作廠商', '請輸入廠商名稱：', parent=dialog)
+                if name is None:
+                    return
+                try:
+                    clean = name.strip()
+                    self.db.add_production_manufacturer(clean, company_id)
+                    refresh_manufacturers(clean)
+                    if combo is not None:
+                        combo.set(clean)
+                except Exception as exc:
+                    messagebox.showerror('管理製作廠商', str(exc), parent=dialog)
+
+            def edit_manufacturer():
+                row = selected_row()
+                if row is None:
+                    messagebox.showwarning('管理製作廠商', '請先選取一個製作廠商。', parent=dialog)
+                    return
+                name = simpledialog.askstring(
+                    '編輯製作廠商', '請修改廠商名稱：', initialvalue=str(row['name'] or ''), parent=dialog
+                )
+                if name is None:
+                    return
+                try:
+                    clean = name.strip()
+                    self.db.update_production_manufacturer(int(row['id']), clean)
+                    refresh_manufacturers(clean)
+                    if combo is not None:
+                        combo.set(clean)
+                except Exception as exc:
+                    messagebox.showerror('管理製作廠商', str(exc), parent=dialog)
+
+            def delete_manufacturer():
+                row = selected_row()
+                if row is None:
+                    messagebox.showwarning('管理製作廠商', '請先選取一個製作廠商。', parent=dialog)
+                    return
+                name = str(row['name'] or '')
+                if not messagebox.askyesno('刪除製作廠商', f'確定要刪除「{name}」嗎？', parent=dialog):
+                    return
+                try:
+                    self.db.delete_production_manufacturer(int(row['id']))
+                    if combo is not None and combo.get().strip() == name:
+                        combo.set('')
+                    refresh_manufacturers()
+                except Exception as exc:
+                    messagebox.showerror('管理製作廠商', str(exc), parent=dialog)
+
+            buttons = ttk.Frame(body)
+            buttons.pack(fill='x', pady=(12, 0))
+            ttk.Button(buttons, text='新增', command=add_manufacturer).pack(side='left')
+            ttk.Button(buttons, text='編輯', command=edit_manufacturer).pack(side='left', padx=8)
+            ttk.Button(buttons, text='刪除', command=delete_manufacturer).pack(side='left')
+            ttk.Button(buttons, text='重新整理', command=refresh_manufacturers).pack(side='left', padx=8)
+            ttk.Button(buttons, text='關閉', command=dialog.destroy).pack(side='right')
+            tree.bind('<Double-1>', lambda _event: edit_manufacturer())
+            dialog.protocol('WM_DELETE_WINDOW', dialog.destroy)
+            refresh_manufacturers()
+            dialog.grab_set()
+            dialog.focus_set()
         def edit_record(existing_id=None):
             old=self.db.production_record(existing_id) if existing_id is not None else None; dialog=tk.Toplevel(win); dialog.title('新增生產記錄' if old is None else '編輯生產記錄'); dialog.resizable(False,False)
             form=ttk.Frame(dialog,padding=18); form.pack(fill='both',expand=True); form.columnconfigure(1,weight=1)
