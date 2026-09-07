@@ -34,6 +34,20 @@ with tempfile.TemporaryDirectory(prefix='offline_excel_db_gui_test_') as temp_di
     app = OfflineDatabaseApp(db)
     app.deiconify()
     app.update()
+
+    # 主功能頁籤應依需求排列：資料管理、公司管理、欄位管理、代碼／名稱對照、備份與還原。
+    notebooks = [w for w in app.winfo_children() if isinstance(w, ttk.Notebook)]
+    assert len(notebooks) == 1
+    main_notebook = notebooks[0]
+    assert [main_notebook.tab(tab, 'text') for tab in main_notebook.tabs()] == [
+        '資料管理', '公司管理', '欄位管理', '代碼／名稱對照', '備份與還原'
+    ]
+    company_buttons = []
+    for child in app.company_tab.winfo_children():
+        for subchild in child.winfo_children():
+            if isinstance(subchild, ttk.Button):
+                company_buttons.append(str(subchild.cget('text')))
+    assert {'新增公司', '編輯公司', '刪除公司', '重新整理'} <= set(company_buttons)
     fields = db.list_fields()
     record_links = db.get_record_links(1)
     assert len(record_links) == 2
